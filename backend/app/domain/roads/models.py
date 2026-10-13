@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from enum import Enum
+import hashlib
+import json
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class RiskLevel(str, Enum):
@@ -90,3 +92,12 @@ class StreetFloodIntelligence(BaseModel):
     roads_geojson: Dict[str, Any] = Field(..., description="GeoJSON FeatureCollection of affected streets (EPSG:4326)")
     intersections_geojson: Dict[str, Any] = Field(..., description="GeoJSON FeatureCollection of affected junctions (EPSG:4326)")
     provenance: Dict[str, str] = Field(..., description="Explicit provenance disclosures")
+
+    @computed_field
+    @property
+    def model_state_id(self) -> str:
+        """Fingerprint of the exact V1 street assessment, including its forcing metadata."""
+        payload = [self.horizon, self.rainfall_mm, self.provenance,
+                   sorted((r.road_id, r.max_depth_m, r.risk_level.value) for r in self.affected_roads)]
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:20]
+        return f"mumbai-v1-street-{digest}"

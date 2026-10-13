@@ -29,6 +29,7 @@ async def get_flood_safe_route(
     rainfall_scenario_mm: Optional[float] = Query(None, ge=0, description="Optional override/scenario rainfall depth [mm]"),
     event: Optional[str] = Query(None, description="Route against a retrospective event hazard instead of the forecast: pass event_id together with step"),
     step: Optional[int] = Query(None, ge=0, description="Timestep index of the retrospective event hazard to route against"),
+    transport_mode: Optional[str] = Query(None, description="Optional Mumbai V1 transport screen: car or walk"),
 ):
     """
     Calculate an optimal flood-safe route between two coordinates in the Mumbai pilot area.
@@ -42,6 +43,10 @@ async def get_flood_safe_route(
     flooded streets the map is showing for that timestep.
     """
     # 1. Resolve which street hazard this route is evaluated against
+    if transport_mode is not None and transport_mode.strip().lower() not in {"car", "walk"}:
+        raise HTTPException(status_code=400, detail="transport_mode must be one of: car, walk")
+    normalized_transport_mode = transport_mode.strip().lower() if transport_mode else None
+    model_state = {}
     if (event is None) != (step is None):
         raise HTTPException(
             status_code=400,
@@ -71,6 +76,14 @@ async def get_flood_safe_route(
                 ),
             )
         affected_roads = timestep.street_risk.affected_roads
+        model_state = {
+            "model_state_id": timestep.street_risk.model_state_id,
+            "state_kind": "HISTORICAL_REPLAY",
+            "event_id": event,
+            "step": step,
+            "horizon": timestep.street_risk.horizon,
+            "rainfall_mm": timestep.street_risk.rainfall_mm,
+        }
         hazard_description = (
             f"Retrospective replay hazard — {ROUTING_HAZARD_EVENTS[event]}, timestep {step} "
             f"({timestep.time_display}): rainfall {timestep.rainfall_mm} mm, peak modelled depth "
@@ -84,6 +97,13 @@ async def get_flood_safe_route(
                 use_cache=True,
             )
             affected_roads = street_intel.affected_roads
+            model_state = {
+                "model_state_id": street_intel.model_state_id,
+                "state_kind": "SCENARIO" if rainfall_scenario_mm is not None else "LIVE_FORECAST",
+                "horizon": street_intel.horizon,
+                "lead_time": street_intel.lead_time,
+                "rainfall_mm": street_intel.rainfall_mm,
+            }
         except HTTPException:
             raise
         except Exception as e:
@@ -111,6 +131,8 @@ async def get_flood_safe_route(
             horizon=horizon,
             affected_roads=affected_roads,
             hazard_description=hazard_description,
+            transport_mode=normalized_transport_mode,
+            model_state=model_state,
         )
         return route_result
     except ValueError as e:

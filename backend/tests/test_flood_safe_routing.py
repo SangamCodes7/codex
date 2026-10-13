@@ -1,4 +1,5 @@
-"""Comprehensive test suite for Phase 1.9 — Flood-Safe Routing API."""
+"""Comprehensive test suite for Mumbai V1 flood-safe routing."""
+import asyncio
 import time
 import pytest
 from fastapi.testclient import TestClient
@@ -7,7 +8,37 @@ from backend.main import app
 from backend.app.domain.roads.models import AffectedRoad, RiskLevel
 from backend.app.domain.routing.graph import RoadGraph
 from backend.app.domain.routing.models import RouteSafetyStatus, SafeRouteResponse
-from backend.app.domain.routing.router import calculate_flood_safe_route
+from backend.app.domain.routing.graph import EdgeData
+from backend.app.domain.routing.router import _run_dijkstra, calculate_flood_safe_route
+from backend.app.domain.routing.transport import TRANSPORT_POLICIES
+import backend.routers.routing as routing_api
+
+
+class _SyntheticGraph:
+    """Small directed graph for route-object tests, independent of city data."""
+
+    def __init__(self, edges):
+        self.adj = {}
+        self.walk_adj = {}
+        self.edge_by_road = {}
+        for edge in edges:
+            self.adj.setdefault(edge.u, []).append(edge)
+            self.walk_adj.setdefault(edge.u, []).append(edge)
+            self.edge_by_road.setdefault(edge.road_id, []).append(edge)
+
+
+def _synthetic_edge(road_id, u, v, length_m):
+    return EdgeData(
+        u=u,
+        v=v,
+        road_id=road_id,
+        osm_id=int(road_id[1:]),
+        name=road_id,
+        highway="residential",
+        length_m=length_m,
+        coords_4326=[[float(u), 0.0], [float(v), 0.0]],
+        access_tags={},
+    )
 
 
 @pytest.fixture(scope="module")
@@ -188,6 +219,165 @@ def test_medium_and_low_flood_penalization():
             assert res.estimated_travel_cost >= res.total_distance_m
 
 
+def test_transport_modes_use_distinct_v1_policies():
+    """Car and walking screens remain on the Mumbai V1 graph but differ by policy."""
+    assert TRANSPORT_POLICIES["car"].exclusion_depth_m == 0.30
+    assert TRANSPORT_POLICIES["walk"].exclusion_depth_m == 0.15
+    assert TRANSPORT_POLICIES["walk"].hazard_depth_m < TRANSPORT_POLICIES["car"].hazard_depth_m
+
+    start = (72.8945, 19.0541)
+    end = (72.9000, 19.0650)
+    car = calculate_flood_safe_route(*start, *end, affected_roads=[], transport_mode="car")
+    walk = calculate_flood_safe_route(*start, *end, affected_roads=[], transport_mode="walk")
+    assert car.transport_mode == "car"
+    assert walk.transport_mode == "walk"
+    assert car.route_geometry is not None
+    assert walk.route_geometry is not None
+
+
+def test_transport_route_keeps_missing_hazard_unknown():
+    """A transport request without a street assessment cannot claim dry roads."""
+    res = calculate_flood_safe_route(
+        72.8945,
+        19.0541,
+        72.9000,
+        19.0650,
+        affected_roads=None,
+        transport_mode="car",
+    )
+    assert res.status == RouteSafetyStatus.UNKNOWN
+    assert res.safety_classification == "UNKNOWN"
+    assert res.max_predicted_flood_depth_m is None
+    assert res.uncertainty_count > 0
+
+
+def test_distance_only_and_safe_paths_use_distinct_route_objects():
+    """A flooded direct walk path loses to a longer dry alternative."""
+    graph = _SyntheticGraph([
+        _synthetic_edge("e101", 0, 1, 100.0),
+        _synthetic_edge("e102", 1, 3, 100.0),
+        _synthetic_edge("e103", 0, 2, 220.0),
+        _synthetic_edge("e104", 2, 3, 220.0),
+    ])
+    hazards = {
+        "e101": (0.149, RiskLevel.MEDIUM),
+        "e102": (0.149, RiskLevel.MEDIUM),
+        "e103": (0.0, RiskLevel.NONE),
+        "e104": (0.0, RiskLevel.NONE),
+    }
+    shortest, _, shortest_distance = _run_dijkstra(graph, 0, 3, {}, False, "walk")
+    safe, safe_cost, safe_distance = _run_dijkstra(graph, 0, 3, hazards, False, "walk")
+
+    assert [edge.road_id for edge in shortest or []] == ["e101", "e102"]
+    assert [edge.road_id for edge in safe or []] == ["e103", "e104"]
+    assert safe_distance > shortest_distance
+    assert safe_cost > shortest_distance
+
+
+def test_transport_hard_exclusion_is_not_traversed():
+    graph = _SyntheticGraph([
+        _synthetic_edge("e201", 0, 1, 100.0),
+        _synthetic_edge("e202", 1, 3, 100.0),
+        _synthetic_edge("e203", 0, 2, 220.0),
+        _synthetic_edge("e204", 2, 3, 220.0),
+    ])
+    hazards = {"e201": (0.15, RiskLevel.MEDIUM), "e202": (0.15, RiskLevel.MEDIUM)}
+    safe, _, _ = _run_dijkstra(graph, 0, 3, hazards, False, "walk")
+    assert [edge.road_id for edge in safe or []] == ["e203", "e204"]
+
+
+def test_partial_transport_hazard_lookup_is_unknown_not_dry():
+    graph = _SyntheticGraph([_synthetic_edge("e301", 0, 1, 100.0)])
+    safe, cost, distance = _run_dijkstra(
+        graph,
+        0,
+        1,
+        {"known": (0.0, RiskLevel.NONE)},
+        False,
+        "walk",
+    )
+    assert safe is not None
+    assert cost > distance
+
+
+def test_same_route_is_explicitly_allowed_when_both_objectives_select_it():
+    graph = _SyntheticGraph([
+        _synthetic_edge("e401", 0, 1, 100.0),
+        _synthetic_edge("e402", 1, 3, 100.0),
+    ])
+    shortest, _, shortest_distance = _run_dijkstra(graph, 0, 3, {}, False, "walk")
+    safe, _, safe_distance = _run_dijkstra(
+        graph,
+        0,
+        3,
+        {"e401": (0.0, RiskLevel.NONE), "e402": (0.0, RiskLevel.NONE)},
+        False,
+        "walk",
+    )
+    assert [edge.road_id for edge in safe or []] == [edge.road_id for edge in shortest or []]
+    assert safe_distance == shortest_distance
+
+
+def test_historical_endpoint_passes_exact_frame_and_walk_mode(monkeypatch):
+    """Replay routing cannot silently fall back to live or another timestep."""
+    captured = {}
+    street_risk = type(
+        "StreetRisk",
+        (),
+        {
+            "affected_roads": ["frame-5-road"],
+            "horizon": "REPLAY-5",
+            "rainfall_mm": 74.0,
+            "model_state_id": "mumbai-v1-frame-5",
+        },
+    )()
+    timesteps = [
+        type(
+            "Timestep",
+            (),
+            {
+                "street_risk": street_risk if index == 5 else None,
+                "time_display": "13:30 IST" if index == 5 else f"step-{index}",
+                "rainfall_mm": 74.0 if index == 5 else 0.0,
+                "peak_flood_depth_m": 0.741 if index == 5 else 0.0,
+            },
+        )()
+        for index in range(6)
+    ]
+    replay = type("Replay", (), {"timesteps": timesteps})()
+
+    def fake_route(**kwargs):
+        captured.update(kwargs)
+        return "route-result"
+
+    monkeypatch.setattr(routing_api, "get_historical_2017_replay", lambda use_cache: replay)
+    monkeypatch.setattr(routing_api, "calculate_flood_safe_route", fake_route)
+
+    result = asyncio.run(
+        routing_api.get_flood_safe_route(
+            start_lon=72.875,
+            start_lat=19.065,
+            end_lon=72.885,
+            end_lat=19.080,
+            event="mumbai-2017-08-29-deluge",
+            step=5,
+            transport_mode="walk",
+        )
+    )
+
+    assert result == "route-result"
+    assert captured["transport_mode"] == "walk"
+    assert captured["affected_roads"] == ["frame-5-road"]
+    assert captured["model_state"] == {
+        "model_state_id": "mumbai-v1-frame-5",
+        "state_kind": "HISTORICAL_REPLAY",
+        "event_id": "mumbai-2017-08-29-deluge",
+        "step": 5,
+        "horizon": "REPLAY-5",
+        "rainfall_mm": 74.0,
+    }
+
+
 def test_no_safe_route_when_completely_blocked(graph):
     """When all adjacent edges to the destination are CRITICAL, UNAVAILABLE is returned."""
     start_lon, start_lat = 72.8945, 19.0541
@@ -250,6 +440,22 @@ def test_api_safe_route_endpoint_success(client):
     assert "provenance" in data
     assert "OpenStreetMap" in data["provenance"]["road_network"]
     assert "Modelled" in data["provenance"]["flood_hazard"]
+
+
+def test_api_rejects_unknown_transport_mode(client):
+    """Transport selection is validated before a costly V1 hazard run."""
+    resp = client.get(
+        "/routing/safe-route",
+        params={
+            "start_lon": 72.8945,
+            "start_lat": 19.0541,
+            "end_lon": 72.9000,
+            "end_lat": 19.0650,
+            "transport_mode": "bike",
+        },
+    )
+    assert resp.status_code == 400
+    assert "transport_mode" in resp.json()["detail"]
 
 
 def test_api_safe_route_scenario_70mm(client):

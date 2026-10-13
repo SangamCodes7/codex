@@ -12,16 +12,20 @@ class RouteSafetyStatus(str, Enum):
     CAUTION = "CAUTION"                # Passable with caution (ponding < 0.30 m; no HIGH/CRITICAL segments)
     UNAVAILABLE = "UNAVAILABLE"        # No route available without crossing >= HIGH risk water barriers
     NO_PATH_FOUND = "NO_PATH_FOUND"    # Origin and destination are topologically disconnected
+    UNKNOWN = "UNKNOWN"              # Missing depth or transport evidence along candidate
 
 
 class RouteSegment(BaseModel):
     """A road segment forming part of a calculated route."""
     road_id: str = Field(..., description="Unique road identifier (e.g. osm_way_12345)")
+    edge_id: Optional[str] = Field(None, description="Directed graph edge identity (road_id:u->v)")
     osm_id: int = Field(..., description="OpenStreetMap way ID")
     name: str = Field(..., description="Road name")
     highway: str = Field(..., description="OSM highway tag")
     length_m: float = Field(..., ge=0, description="Segment length in meters")
-    flood_depth_m: float = Field(0.0, ge=0, description="Modelled flood depth on this segment [m]")
+    flood_depth_m: Optional[float] = Field(None, ge=0, description="Modelled depth; null means UNKNOWN")
+    velocity_m_s: Optional[float] = None
+    uncertain: bool = False
     risk_level: str = Field("NONE", description="Operational flood risk tier (NONE, LOW, MEDIUM, HIGH, CRITICAL)")
     geometry: Dict[str, Any] = Field(..., description="GeoJSON LineString (EPSG:4326)")
 
@@ -29,7 +33,9 @@ class RouteSegment(BaseModel):
 class ShortestPathComparison(BaseModel):
     """Summary comparison with the unconstrained (direct) shortest path."""
     distance_m: float = Field(..., ge=0, description="Unconstrained direct distance in meters")
-    max_flood_depth_m: float = Field(0.0, ge=0, description="Peak flood depth along direct shortest path [m]")
+    edge_ids: List[str] = Field(default_factory=list, description="Ordered directed graph edges in the distance-only path")
+    max_flood_depth_m: Optional[float] = Field(None, ge=0, description="Maximum available depth; null when no direct segment has a known depth")
+    unknown_segment_count: int = 0
     has_flooded_roads: bool = Field(False, description="True if direct shortest path traverses flooded roads")
     flooded_road_count: int = Field(0, description="Number of flooded road segments on direct shortest path")
     geometry: Optional[Dict[str, Any]] = Field(None, description="GeoJSON LineString of the unconstrained direct path (EPSG:4326), drawn for comparison against the safe route")
@@ -47,8 +53,15 @@ class SafeRouteResponse(BaseModel):
     """Complete flood-safe routing evaluation response."""
     status: RouteSafetyStatus = Field(..., description="Route safety evaluation status")
     total_distance_m: float = Field(0.0, ge=0, description="Total travel distance along route in meters")
-    estimated_travel_cost: float = Field(0.0, ge=0, description="Weighted travel cost accounting for flood depth penalties")
-    max_predicted_flood_depth_m: float = Field(0.0, ge=0, description="Maximum flood depth along calculated route [m]")
+    estimated_travel_cost: Optional[float] = Field(None, ge=0, description="Weighted distance, not ETA; null when no route exists")
+    max_predicted_flood_depth_m: Optional[float] = Field(None, ge=0, description="Maximum available route depth; null when no route segment has a known depth")
+    transport_mode: str = "car"
+    safety_classification: str = "UNKNOWN"
+    uncertainty_count: int = 0
+    explanation: str = ""
+    model_state: Dict[str, Any] = Field(default_factory=dict)
+    transport_policy: Dict[str, Any] = Field(default_factory=dict)
+    route_edge_ids: List[str] = Field(default_factory=list, description="Ordered directed graph edges in the returned route")
     roads_avoided: List[str] = Field(default_factory=list, description="Names of flooded roads bypassed by this route")
     route_geometry: Optional[Dict[str, Any]] = Field(None, description="GeoJSON LineString of the complete route (EPSG:4326)")
     segments: List[RouteSegment] = Field(default_factory=list, description="Ordered sequence of road segments")

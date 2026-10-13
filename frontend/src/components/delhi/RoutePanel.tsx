@@ -117,6 +117,7 @@ const RoutePanel = ({
     () => routeResult?.recommended_route?.risk_segments?.features ?? [],
     [routeResult],
   );
+  const recommended = routeResult?.recommended_route;
 
   const fmtTime = (iso: string) =>
     new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -246,26 +247,26 @@ const RoutePanel = ({
         </div>
       </div>
 
-      {routeResult && !running && (
+      {routeResult && recommended && !running && (
         <>
           {/* Recommended / alternative */}
           <div className="delhi-section flood-timeline-panel">
             <div className="delhi-section-head timeline-header timeline-header">
               <span className="delhi-section-title timeline-heading timeline-heading">RECOMMENDED ROUTE</span>
               <span className="delhi-prov-tag prov-computed">
-                {routeResult.recommended_route.route_state}
+                {recommended.route_state}
               </span>
             </div>
             <div className="route-stat-row">
               <div className="route-stat">
                 <span className="stat-value">
-                  {routeResult.recommended_route.total_distance_km} km
+                  {recommended.total_distance_km} km
                 </span>
                 <span className="stat-label">distance</span>
               </div>
               <div className="route-stat">
                 <span className="stat-value">
-                  {routeResult.recommended_route.estimated_travel_time_min} min
+                  {recommended.estimated_travel_time_min ?? '—'} {recommended.estimated_travel_time_min == null ? '' : 'min'}
                 </span>
                 <span className="stat-label">est. travel time (ASSUMED speeds)</span>
               </div>
@@ -278,10 +279,10 @@ const RoutePanel = ({
             </div>
             <div className="route-risk-chips">
               {[
-                ['elevated', routeResult.recommended_route.flood_risk_summary.elevated_risk_segments, 'ELEVATED-RISK'],
-                ['unknown-chip', routeResult.recommended_route.flood_risk_summary.unknown_segments, 'UNKNOWN'],
-                ['low', routeResult.recommended_route.flood_risk_summary.low_risk_segments, 'LOW-RISK'],
-                ['blocked', routeResult.recommended_route.flood_risk_summary.blocked_segments, 'BLOCKED'],
+                ['elevated', recommended.flood_risk_summary.elevated_risk_segments, 'ELEVATED-RISK'],
+                ['unknown-chip', recommended.flood_risk_summary.unknown_segments, 'UNKNOWN'],
+                ['low', recommended.flood_risk_summary.low_risk_segments, 'LOW-RISK'],
+                ['blocked', recommended.flood_risk_summary.blocked_segments, 'BLOCKED'],
               ].map(([cls, count, label]) => (
                 <span key={label as string} className={`risk-chip chip-${cls}`}>
                   {count as number} {label as string}
@@ -293,7 +294,7 @@ const RoutePanel = ({
                 <span className="meta-k">ALTERNATIVE (dashed on map)</span>
                 <span className="meta-v">
                   {routeResult.alternative_route.total_distance_km} km ·{' '}
-                  {routeResult.alternative_route.estimated_travel_time_min} min ·{' '}
+                  {routeResult.alternative_route.estimated_travel_time_min ?? '—'} {routeResult.alternative_route.estimated_travel_time_min == null ? '' : 'min'} ·{' '}
                   {routeResult.alternative_route.flood_risk_summary.elevated_risk_segments} elevated ·{' '}
                   {routeResult.alternative_route.flood_risk_summary.unknown_segments} unknown
                 </span>
@@ -317,8 +318,9 @@ const RoutePanel = ({
                 <li key={i}>{line}</li>
               ))}
             </ul>
-            <div className="route-compare-table">
-              <table className="delhi-table">
+            {routeResult.route_comparison.recommended ? (
+              <div className="route-compare-table">
+                <table className="delhi-table">
                 <thead>
                   <tr>
                     <th>Metric</th>
@@ -336,7 +338,7 @@ const RoutePanel = ({
                   ].map(([label, key]) => (
                     <tr key={key as string}>
                       <td>{label as string}</td>
-                      <td className="mono">{String(routeResult.route_comparison.recommended[key as keyof typeof routeResult.route_comparison.recommended])}</td>
+                      <td className="mono">{String(routeResult.route_comparison.recommended?.[key as keyof NonNullable<typeof routeResult.route_comparison.recommended>] ?? '—')}</td>
                       <td className="mono">
                         {routeResult.route_comparison.alternative
                           ? String(routeResult.route_comparison.alternative[key as keyof NonNullable<typeof routeResult.route_comparison.alternative>])
@@ -345,8 +347,11 @@ const RoutePanel = ({
                     </tr>
                   ))}
                 </tbody>
-              </table>
-            </div>
+                </table>
+              </div>
+            ) : (
+              <div className="delhi-note">No recommended route is available under the selected transport and model state.</div>
+            )}
           </div>
 
           {/* Evidence + freshness */}

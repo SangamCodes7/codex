@@ -50,7 +50,12 @@ const ReplayControls = ({
   onStreets?: (streets: StreetsIntel | null) => void;
   // Reports the active (event, timestep) to the app so historical
   // safe-route computations follow the replay clock (V1 behaviour).
-  onReplayContext?: (ctx: { eventId: string; timestepIndex: number }) => void;
+  onReplayContext?: (ctx: {
+    eventId: string;
+    timestepIndex: number;
+    stateId?: string | null;
+    complete24h?: boolean;
+  }) => void;
 }) => {
   const [replay, setReplay] = useState<EventReplayResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -171,12 +176,21 @@ const ReplayControls = ({
     return () => clearInterval(t);
   }, [playing, replay]);
 
-  // Route against the nearest documented chain state when the clock sits
-  // on an hour without one (pre-storm: dry step 0; post-window: last step).
+  // Route against the exact displayed depth frame.  The documented chain
+  // index is still used by the flow overlay, but it is not a valid identity
+  // for a completed 24-hour surface frame.
   const routeStepIdx = docIdx ?? (hourIdx < docStartHour ? 0 : Math.max(0, steps.length - 1));
+  const routeDepthIdx = completion ? hourIdx : docIdx;
   useEffect(() => {
-    onReplayContext?.({ eventId: REPLAY_EVENT_ID, timestepIndex: routeStepIdx });
-  }, [routeStepIdx, onReplayContext]);
+    // Clear the identity while the selected depth frame is loading.  The
+    // route must never reuse the previous replay frame during this gap.
+    onReplayContext?.({
+      eventId: REPLAY_EVENT_ID,
+      timestepIndex: routeDepthIdx ?? routeStepIdx,
+      stateId: null,
+      complete24h: completion != null,
+    });
+  }, [routeDepthIdx, routeStepIdx, completion, onReplayContext]);
 
   // Map flow follows the clock. Reach states exist only for documented
   // chain hours; completed hours push their (model) rain value, hours with
@@ -230,6 +244,12 @@ const ReplayControls = ({
       .getEventDepth(replay.event_id, idx, completion != null)
       .then((d) => {
         if (!cancelled) {
+          onReplayContext?.({
+            eventId: REPLAY_EVENT_ID,
+            timestepIndex: routeDepthIdx ?? routeStepIdx,
+            stateId: d.step?.routing_state_id ?? null,
+            complete24h: completion != null,
+          });
           onDepthCells(showDepthCells ? d.step?.depth_cells ?? [] : []);
           onDepthPolygons(showDepthPolygons ? d.step?.depth_polygons ?? null : null);
           onStreets(showRoads ? d.step?.streets ?? null : null);
@@ -245,8 +265,8 @@ const ReplayControls = ({
     return () => {
       cancelled = true;
     };
-  }, [replay, hourIdx, docIdx, completion, showDepthCells, showDepthPolygons, showRoads,
-      onDepthCells, onDepthPolygons, onStreets]);
+  }, [replay, hourIdx, docIdx, routeStepIdx, routeDepthIdx, completion, showDepthCells, showDepthPolygons, showRoads,
+      onDepthCells, onDepthPolygons, onStreets, onReplayContext]);
 
   if (loading) {
     return <div className="delhi-panel-status">Loading historical replay…</div>;

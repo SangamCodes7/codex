@@ -8,6 +8,7 @@ import {
   type SafeRouteResponse,
   type ScenarioSafeRouteResponse,
   type SurfaceHotspot,
+  routeCoordinates,
 } from '../../api/delhi';
 import RainOverlay from './RainOverlay';
 import { getBasemapStyle, type MapTheme } from '../../config/mapStyles';
@@ -752,8 +753,9 @@ const DelhiMap = ({
     }
     set('route-pins', { type: 'FeatureCollection', features: pinFeatures });
 
-    if (routeResult?.recommended_route?.geometry?.coordinates?.length) {
-      const coords = routeResult.recommended_route.geometry.coordinates;
+    const routeCoords = routeCoordinates(routeResult?.recommended_route?.geometry);
+    if (routeCoords.length) {
+      const coords = routeCoords;
       let minLon = coords[0][0];
       let maxLon = coords[0][0];
       let minLat = coords[0][1];

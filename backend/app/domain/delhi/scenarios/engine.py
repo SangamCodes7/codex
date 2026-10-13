@@ -58,6 +58,7 @@ from backend.app.domain.delhi.digital_twin.kushak_scenario_ensemble import (
     SCENARIO_RUNOFF_C,
 )
 from backend.app.domain.delhi.drainage.graph import get_drainage_graph
+from backend.app.domain.delhi.routing.network import get_road_graph
 from backend.app.domain.delhi.drainage.loading import (
     INITIAL_STORAGE_M3,
     channel_depth_estimate_cm,
@@ -261,6 +262,19 @@ def _run_member(
         d = (win_x - ux[0]) ** 2 + (win_y - uy[0]) ** 2
         edge_node_local[e.edge_id] = int(np.argmin(d))
 
+    # The scenario UI's existing ``road_depths`` map is keyed to the
+    # drainage-graph edge ids.  Safe routing uses the committed OSM road
+    # graph's directed edge keys, so keep a separate, explicit surface-depth
+    # map for that consumer rather than silently mixing graph identities.
+    road_graph = get_road_graph()
+    routing_edge_midpoints = {
+        edge_key: (
+            (road_graph.node_lonlat[edge.u][0] + road_graph.node_lonlat[edge.v][0]) / 2.0,
+            (road_graph.node_lonlat[edge.u][1] + road_graph.node_lonlat[edge.v][1]) / 2.0,
+        )
+        for edge_key, edge in road_graph.edge_index.items()
+    }
+
     scale = member_scale_for(scenario, member_index)
     v1_steps: List[V1DepthStep] = scenario_v1_depth_steps(
         scenario, scale, capacity_by_edge, fields
@@ -285,6 +299,7 @@ def _run_member(
         _depth_fields_collector.append(np.asarray(v1.depth_m * 100.0, dtype=np.float64))
         steps.append({
             "timestep_index": i,
+            "routing_state_id": f"{scenario_id}:{seed}:{member_index}:t{i}",
             "depth_cells": depth_cells_from_v1(v1, structure),
             "depth_polygons": depth_polygons_from_v1(v1, structure),
             "time_start": ts.start.isoformat(),
@@ -293,6 +308,8 @@ def _run_member(
             "flooded_cells": v1.flooded_cells,
             "flood_state": classify_depth_cm(max_cm),
             "per_reach_surface_inflow_m3_s": surf["per_reach_surface_inflow_m3_s"],
+            "road_depths": road_depths_from_v1(v1, structure, edge_midpoints),
+            "routing_road_depths": road_depths_from_v1(v1, structure, routing_edge_midpoints),
             "v1_mass_balance": {
                 "total_runoff_m3": round(v1.total_runoff_volume_m3, 1),
                 "conveyed_m3": round(v1.conveyed_volume_m3, 1),
@@ -396,6 +413,7 @@ def _run_member(
         "max_depth_cm_traj": [round(v, 1) for v in max_depth_cm_track],
         "edge_depths": edge_depths,
         "road_depths": road_depths,
+        "routing_road_depths": steps[-1].get("routing_road_depths", {}),
         "source_type": SIM_MODEL,
         "scenario_id": scenario_id,
     }
@@ -654,6 +672,7 @@ def _compose_result(
                 if k in ("member_index", "member_scale", "forcing_depths_mm",
                          "inflow_m3_s", "steps", "max_depth_cm_traj",
                          "edge_depths", "road_depths", "source_type",
+                          "routing_road_depths",
                          "scenario_id", "telemetry", "drainage_loading")
             }
             for m in members

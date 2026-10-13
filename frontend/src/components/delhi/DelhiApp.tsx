@@ -16,6 +16,7 @@ import {
   type ScenarioSafeRouteResponse,
   type StreetsIntel,
   type SurfaceHotspot,
+  type TransportMode,
   type WhatIfResponse,
 } from '../../api/delhi';
 
@@ -31,9 +32,12 @@ type DelhiRouteResult = SafeRouteResponse | ScenarioSafeRouteResponse;
 // What a route must be computed against: the live nowcast horizon, the
 // replayed event timestep, or the scenario intensity currently displayed.
 type RouteContext =
-  | { mode: 'live' }
-  | { mode: 'historical'; replay: { eventId: string; timestepIndex: number } }
-  | { mode: 'scenario'; rainfallMmH: number };
+  | { mode: 'live'; stateId: string; rainfallMm?: number[] }
+  | {
+      mode: 'historical';
+      replay: { eventId: string; timestepIndex: number; stateId: string; complete24h: boolean };
+    }
+  | { mode: 'scenario'; rainfallMmH: number; stateId: string };
 
 const HORIZONS: Horizon[] = ['NOW', '+1h', '+2h', '+3h'];
 const SCENARIO_PRESETS = [20, 40, 50, 70];
@@ -106,11 +110,19 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
   const [routeHudOpen, setRouteHudOpen] = useState(false);
   const [routeLoading, setRouteLoading] = useState(false);
   const [routeError, setRouteError] = useState<string | null>(null);
+  const [transportMode, setTransportMode] = useState<TransportMode | null>(null);
   // Current replay selection (event + timestep), reported by ReplayControls.
   // Historical safe routes are computed against exactly this state.
-  const [replayContext, setReplayContext] = useState<{ eventId: string; timestepIndex: number }>({
+  const [replayContext, setReplayContext] = useState<{
+    eventId: string;
+    timestepIndex: number;
+    stateId: string | null;
+    complete24h: boolean;
+  }>({
     eventId: 'EVT-2024-06-27',
     timestepIndex: 0,
+    stateId: null,
+    complete24h: false,
   });
   const [drainageGraph, setDrainageGraph] = useState<DrainageGraphResponse | null>(null);
   const [surfaceHotspots, setSurfaceHotspots] = useState<SurfaceHotspot[]>([]);
@@ -182,6 +194,7 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
   // MODEL SCENARIO: real backend computation per intensity (cached server-side).
   useEffect(() => {
     if (mode !== 'SCENARIO') return;
+    setScenarioState(null);
     setScenarioLoading(true);
     delhiApi
       .getWhatIf(scenarioMm)
@@ -200,6 +213,8 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
   // same origin/destination against the new mode's state instead of
   // dumping the user back into the live forecast.
   const switchMode = (next: Mode) => {
+    routeRequestSeq.current += 1;
+    routeInflightKey.current = null;
     setMode(next);
     setMapFlow(EMPTY_FLOW);
     setRoutePick(null);
@@ -211,16 +226,10 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
     setRouteResult(null);
     setRouteError(null);
     setRouteLoading(false);
+    setReplayContext((prev) => ({ ...prev, stateId: null, complete24h: false }));
     const hasPicks = routePicks.origin !== null && routePicks.destination !== null;
     if (hasPicks) {
       setRouteHudOpen(true);
-      // REPLAY and SCENARIO recomputation is driven by the context effects
-      // below (they own the clock/intensity state), LIVE is fetched here.
-      if (next === 'LIVE') {
-        void fetchSafeRoute(routePicks.origin!.coords, routePicks.destination!.coords, {
-          mode: 'live',
-        });
-      }
     }
   };
 
@@ -239,12 +248,14 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
       destination: [number, number],
       context?: RouteContext,
     ) => {
+      const contextStateId = context?.mode === 'historical' ? context.replay.stateId : context?.stateId;
+      if (!transportMode || !context || !contextStateId) return;
       const key =
         context?.mode === 'scenario'
-          ? `scenario:${context.rainfallMmH}`
+          ? `scenario:${context.rainfallMmH}:${context.stateId}:${origin.join(',')}:${destination.join(',')}`
           : context?.mode === 'historical'
-            ? `historical:${context.replay.eventId}:${context.replay.timestepIndex}`
-            : `live:${horizon}`;
+            ? `historical:${context.replay.eventId}:${context.replay.timestepIndex}:${context.replay.stateId}:${context.replay.complete24h}:${origin.join(',')}:${destination.join(',')}`
+            : `live:${horizon}:${context.stateId}:${origin.join(',')}:${destination.join(',')}`;
       if (key === routeInflightKey.current) return;
       const seq = ++routeRequestSeq.current;
       routeInflightKey.current = key;
@@ -257,6 +268,8 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
                 origin,
                 destination,
                 rainfall_mm_h: context.rainfallMmH,
+                transport_mode: transportMode,
+                model_state_id: context.stateId,
               })
             : context?.mode === 'historical'
               ? await delhiApi.getSafeRoute({
@@ -265,12 +278,18 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
                   mode: 'historical',
                   event_id: context.replay.eventId,
                   timestep_index: context.replay.timestepIndex,
+                  complete_24h: context.replay.complete24h,
+                  transport_mode: transportMode,
+                  model_state_id: context.replay.stateId,
                 })
               : await delhiApi.getSafeRoute({
                   origin,
                   destination,
                   mode: 'live',
                   departure_hour: Math.max(0, HORIZONS.indexOf(horizon)),
+                  transport_mode: transportMode,
+                  model_state_id: context.stateId,
+                  client_rainfall_mm: context.rainfallMm,
                 });
         if (seq !== routeRequestSeq.current) return;
         setRouteResult(res);
@@ -286,25 +305,62 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
         }
       }
     },
-    [horizon],
+    [horizon, transportMode],
   );
 
   const routeContext = useCallback(
-    (): RouteContext =>
+    (): RouteContext | undefined =>
       mode === 'SCENARIO'
-        ? { mode: 'scenario', rainfallMmH: scenarioMm }
+        ? scenarioState?.routing_state_id
+          ? { mode: 'scenario', rainfallMmH: scenarioMm, stateId: scenarioState.routing_state_id }
+          : undefined
         : mode === 'REPLAY'
-          ? { mode: 'historical', replay: replayContext }
-          : { mode: 'live' },
-    [mode, replayContext, scenarioMm],
+          ? replayContext.stateId
+            ? {
+                mode: 'historical',
+                replay: {
+                  eventId: replayContext.eventId,
+                  timestepIndex: replayContext.timestepIndex,
+                  stateId: replayContext.stateId,
+                  complete24h: replayContext.complete24h,
+                },
+              }
+            : undefined
+          : activeHorizonState?.routing_state_id
+            ? {
+                mode: 'live',
+                stateId: activeHorizonState.routing_state_id,
+                rainfallMm:
+                  liveState?.horizons.every((state) => typeof state.rainfall_mm === 'number')
+                    ? liveState.horizons.map((state) => state.rainfall_mm as number)
+                    : undefined,
+              }
+            : undefined,
+    [mode, replayContext, scenarioMm, scenarioState, activeHorizonState, liveState],
   );
 
   // ReplayControls reports its (event, timestep); identity-stable so the
   // panel's reporting effect never re-runs because of us.
   const handleReplayContext = useCallback(
-    (ctx: { eventId: string; timestepIndex: number }) => {
+    (ctx: {
+      eventId: string;
+      timestepIndex: number;
+      stateId?: string | null;
+      complete24h?: boolean;
+    }) => {
+      const complete24h = ctx.complete24h ?? false;
       setReplayContext((prev) =>
-        prev.eventId === ctx.eventId && prev.timestepIndex === ctx.timestepIndex ? prev : ctx,
+        prev.eventId === ctx.eventId &&
+        prev.timestepIndex === ctx.timestepIndex &&
+        prev.stateId === (ctx.stateId ?? null) &&
+        prev.complete24h === complete24h
+          ? prev
+          : {
+              eventId: ctx.eventId,
+              timestepIndex: ctx.timestepIndex,
+              stateId: ctx.stateId ?? null,
+              complete24h,
+            },
       );
     },
     [],
@@ -314,21 +370,29 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
   // against the new timestep. Guarded by the route's own event/timestep so
   // a completed fetch can never re-trigger itself.
   useEffect(() => {
-    if (mode !== 'REPLAY') return;
+    if (mode !== 'REPLAY' || !transportMode || !replayContext.stateId) return;
     if (!routePicks.origin || !routePicks.destination) return;
     if (
       routeResult &&
       routeResult.mode === 'HISTORICAL' &&
       routeResult.event_id === replayContext.eventId &&
-      routeResult.timestep_index === replayContext.timestepIndex
+      routeResult.timestep_index === replayContext.timestepIndex &&
+      routeResult.transport_mode === transportMode &&
+      routeResult.model_state?.state_id === replayContext.stateId
     )
       return;
-    if (routeResult && routeResult.mode !== 'HISTORICAL') return;
-    void fetchSafeRoute(routePicks.origin.coords, routePicks.destination.coords, {
-      mode: 'historical',
-      replay: replayContext,
-    });
-  }, [mode, replayContext, routeResult, routePicks, fetchSafeRoute]);
+    if (routeResult && (routeResult.mode !== 'HISTORICAL' || routeResult.transport_mode !== transportMode)) return;
+    setRouteResult(null);
+      void fetchSafeRoute(routePicks.origin.coords, routePicks.destination.coords, {
+        mode: 'historical',
+        replay: {
+          eventId: replayContext.eventId,
+          timestepIndex: replayContext.timestepIndex,
+          stateId: replayContext.stateId,
+          complete24h: replayContext.complete24h,
+        },
+      });
+  }, [mode, replayContext, routeResult, routePicks, fetchSafeRoute, transportMode]);
 
   // Same V1 pattern for the scenario clock: changing the WHAT-IF intensity
   // re-evaluates an active route against the new modelled street depths, so
@@ -336,27 +400,74 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
   // Guarded by the route's own intensity, so a completed fetch never
   // re-triggers itself.
   useEffect(() => {
-    if (mode !== 'SCENARIO') return;
+    if (mode !== 'SCENARIO' || !transportMode || !scenarioState?.routing_state_id) return;
     if (!routePicks.origin || !routePicks.destination) return;
     if (
       routeResult &&
       routeResult.mode === 'SCENARIO' &&
-      routeResult.scenario.rainfall_mm_h === scenarioMm
+      routeResult.transport_mode === transportMode &&
+      routeResult.scenario.rainfall_mm_h === scenarioMm &&
+      routeResult.model_state?.state_id === scenarioState.routing_state_id
     )
       return;
+    setRouteResult(null);
     void fetchSafeRoute(routePicks.origin.coords, routePicks.destination.coords, {
       mode: 'scenario',
       rainfallMmH: scenarioMm,
+      stateId: scenarioState.routing_state_id,
     });
-  }, [mode, scenarioMm, routeResult, routePicks, fetchSafeRoute]);
+  }, [mode, scenarioMm, scenarioState, routeResult, routePicks, fetchSafeRoute, transportMode]);
+
+  // A refreshed live forecast can retain the same horizon label while its
+  // underlying model-state identity changes.  The route must follow the
+  // active frame rather than remain attached to the previous forecast.
+  useEffect(() => {
+    if (mode !== 'LIVE' || !transportMode || !activeHorizonState?.routing_state_id) return;
+    if (!routePicks.origin || !routePicks.destination) return;
+    if (
+      routeResult &&
+      routeResult.mode === 'LIVE' &&
+      routeResult.transport_mode === transportMode &&
+      routeResult.model_state?.state_id === activeHorizonState.routing_state_id
+    )
+      return;
+    setRouteResult(null);
+    void fetchSafeRoute(routePicks.origin.coords, routePicks.destination.coords, {
+      mode: 'live',
+      stateId: activeHorizonState.routing_state_id,
+      rainfallMm:
+        liveState?.horizons.every((state) => typeof state.rainfall_mm === 'number')
+          ? liveState.horizons.map((state) => state.rainfall_mm as number)
+          : undefined,
+    });
+  }, [mode, activeHorizonState, liveState, routeResult, routePicks, fetchSafeRoute, transportMode]);
+
+  // Selecting a transport mode is the final gate before any route request.
+  // If points already exist, the new mode is evaluated against the exact
+  // active frame; otherwise the selector simply arms the next map pick.
+  useEffect(() => {
+    if (!routeHudOpen || !transportMode || !routePicks.origin || !routePicks.destination) return;
+    const context = routeContext();
+    if (!context) return;
+    if (
+      routeResult?.transport_mode === transportMode &&
+      routeResult.model_state?.state_id === (context.mode === 'historical' ? context.replay.stateId : context.stateId)
+    )
+      return;
+    setRouteResult(null);
+    void fetchSafeRoute(routePicks.origin.coords, routePicks.destination.coords, context);
+  }, [routeHudOpen, transportMode, routePicks, routeContext, routeResult, fetchSafeRoute]);
 
   const handleExitRouting = useCallback(() => {
+    routeRequestSeq.current += 1;
+    routeInflightKey.current = null;
     setRouteHudOpen(false);
     setRoutePick(null);
     setRouteResult(null);
     setRouteError(null);
     setRouteLoading(false);
     setRoutePicks({ origin: null, destination: null });
+    setTransportMode(null);
   }, []);
 
   const handleMapClick = (lonlat: [number, number]) => {
@@ -366,7 +477,8 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
       setRoutePicks((prev) => ({ ...prev, origin: newOrigin }));
       if (routePicks.destination) {
         setRoutePick(null);
-        void fetchSafeRoute(lonlat, routePicks.destination.coords, routeContext());
+        const context = routeContext();
+        if (context && transportMode) void fetchSafeRoute(lonlat, routePicks.destination.coords, context);
       } else {
         setRoutePick('destination');
       }
@@ -375,7 +487,8 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
       setRoutePicks((prev) => ({ ...prev, destination: newDest }));
       setRoutePick(null);
       if (routePicks.origin) {
-        void fetchSafeRoute(routePicks.origin.coords, lonlat, routeContext());
+        const context = routeContext();
+        if (context && transportMode) void fetchSafeRoute(routePicks.origin.coords, lonlat, context);
       } else {
         setRoutePick('origin');
       }
@@ -913,17 +1026,27 @@ const DelhiApp = ({ theme }: { theme?: MapTheme } = {}) => {
             error={routeError}
             onExit={handleExitRouting}
             onPick={(t) => setRoutePick(t)}
+            transportMode={transportMode}
+            onTransportMode={(next) => {
+              routeRequestSeq.current += 1;
+              routeInflightKey.current = null;
+              setTransportMode(next);
+              setRouteResult(null);
+              setRouteError(null);
+            }}
             onPreset={(o, d) => {
               setRoutePicks({ origin: { coords: o }, destination: { coords: d } });
               setRoutePick(null);
-              void fetchSafeRoute(o, d, routeContext());
+              const context = routeContext();
+              if (context && transportMode) void fetchSafeRoute(o, d, context);
             }}
             onRetry={() => {
               if (routePicks.origin && routePicks.destination) {
-                void fetchSafeRoute(
+                const context = routeContext();
+                if (context && transportMode) void fetchSafeRoute(
                   routePicks.origin.coords,
                   routePicks.destination.coords,
-                  routeContext(),
+                  context,
                 );
               }
             }}
@@ -1098,6 +1221,8 @@ const SafeRouteHud = ({
   error,
   onExit,
   onPick,
+  transportMode,
+  onTransportMode,
   onPreset,
   onRetry,
 }: {
@@ -1108,10 +1233,29 @@ const SafeRouteHud = ({
   error: string | null;
   onExit: () => void;
   onPick: (t: 'origin' | 'destination') => void;
+  transportMode: TransportMode | null;
+  onTransportMode: (mode: TransportMode) => void;
   onPreset: (o: [number, number], d: [number, number]) => void;
   onRetry: () => void;
 }) => {
   const rec = routeResult?.recommended_route;
+  const classification = routeResult?.safety_classification ?? rec?.safety_classification ?? null;
+  const statusClass =
+    classification === 'LOWER_RISK'
+      ? 'status-safe'
+      : classification === 'CAUTION'
+        ? 'status-caution'
+        : classification === 'NO_SAFE_ROUTE'
+          ? 'status-no_path_found'
+          : 'status-unavailable';
+  const modelState = routeResult?.model_state;
+  const modelFrame = modelState
+    ? routeResult?.mode === 'SCENARIO'
+      ? `Scenario${modelState.scenario_id ? ` ${modelState.scenario_id}` : ''}`
+      : routeResult?.mode === 'HISTORICAL'
+        ? `Replay ${modelState.event_id ?? 'event'} · t${modelState.timestep_index ?? '—'}`
+        : `Forecast ${modelState.timestep_index === 0 ? 'NOW' : `t+${modelState.timestep_index}h`}`
+    : null;
   return (
     <div className="safe-route-hud-panel">
       <div className="route-hud-header">
@@ -1121,8 +1265,8 @@ const SafeRouteHud = ({
         </div>
         <div className="route-hud-actions">
           {rec && (
-            <span className="route-status-badge status-safe">
-              EVALUATED
+            <span className={`route-status-badge ${statusClass}`}>
+              {classification ?? 'EVALUATED'}
             </span>
           )}
           <button type="button" className="route-close-btn" onClick={onExit} title="Exit safe routing">
@@ -1130,11 +1274,28 @@ const SafeRouteHud = ({
           </button>
         </div>
       </div>
+      <div className="route-transport-selector" role="group" aria-label="Transport mode">
+        <div className="presets-label">SELECT TRANSPORT BEFORE CALCULATING</div>
+        <div className="presets-buttons">
+          <button type="button" className={`preset-btn ${transportMode === 'car' ? 'active' : ''}`} onClick={() => onTransportMode('car')} aria-pressed={transportMode === 'car'}>
+            🚗 Car
+          </button>
+          <button type="button" className={`preset-btn ${transportMode === 'walk' ? 'active' : ''}`} onClick={() => onTransportMode('walk')} aria-pressed={transportMode === 'walk'}>
+            🚶 Walk
+          </button>
+        </div>
+        {!transportMode && <div className="delhi-note">Choose Car or Walk before the model calculates a route.</div>}
+      </div>
       <div className="route-step-banner">
         {loading ? (
           <div className="step-prompt loading">
             <span className="route-loading-spinner" />
             <span>Computing flood-safe route along corridor…</span>
+          </div>
+        ) : !transportMode ? (
+          <div className="step-prompt">
+            <span className="step-pin origin-pin">MODE</span>
+            <span>Select Car or Walk above to continue.</span>
           </div>
         ) : !picks.origin ? (
           <div className="step-prompt">
@@ -1192,6 +1353,15 @@ const SafeRouteHud = ({
         </div>
       )}
 
+      {routeResult && !rec && !loading && (
+        <div className="route-no-result-banner" role="status">
+          <strong>{classification ?? 'NO_SAFE_ROUTE'}</strong>
+          {(routeResult.explanation ?? []).slice(0, 2).map((line, index) => (
+            <span key={index}>{line}</span>
+          ))}
+        </div>
+      )}
+
       <div className="route-presets-section">
         <div className="presets-label">
           {pickTarget ? `CLICK MAP TO PLACE ${pickTarget.toUpperCase()}` : 'OR CHOOSE CORRIDOR PRESET:'}
@@ -1217,13 +1387,23 @@ const SafeRouteHud = ({
       </div>
       {rec && (
         <>
-          <div className="route-metrics-grid">
+            <div className="route-metrics-grid">
+            <div className="route-metric-card">
+              <span className="m-label">TRANSPORT</span>
+              <span className="m-val">{routeResult?.transport_mode ?? '—'}</span>
+              <span className="m-sub">mode-specific graph rules</span>
+            </div>
+            <div className="route-metric-card">
+              <span className="m-label">SAFETY</span>
+              <span className="m-val">{routeResult?.safety_classification ?? '—'}</span>
+              <span className="m-sub">not a guarantee</span>
+            </div>
             <div className="route-metric-card">
               <span className="m-label">ROUTE DISTANCE</span>
               <span className="m-val">
                 {rec.total_distance_km} <span className="m-unit">km</span>
               </span>
-              <span className="m-sub">{rec.estimated_travel_time_min} min est.</span>
+                <span className="m-sub">{rec.estimated_travel_time_min == null ? 'ETA unavailable' : `${rec.estimated_travel_time_min} min est.`}</span>
             </div>
             <div className="route-metric-card">
               <span className="m-label">ELEVATED-RISK</span>
@@ -1242,6 +1422,18 @@ const SafeRouteHud = ({
               <span className="m-sub">no model coverage (not safe)</span>
             </div>
             <div className="route-metric-card">
+              <span className="m-label">UNCERTAIN / HAZARDOUS</span>
+              <span className="m-val">
+                {rec.flood_risk_summary.uncertain_segments ?? 0} / {rec.flood_risk_summary.hazardous_segments ?? 0}
+              </span>
+              <span className="m-sub">missing or elevated hazard inputs</span>
+            </div>
+            <div className="route-metric-card">
+              <span className="m-label">MAX DEPTH</span>
+              <span className="m-val">{rec.max_depth_m == null ? 'UNKNOWN' : `${(rec.max_depth_m * 100).toFixed(0)} cm`}</span>
+              <span className="m-sub">velocity: {rec.max_velocity_m_s == null ? 'UNKNOWN' : `${rec.max_velocity_m_s} m/s`}</span>
+            </div>
+            <div className="route-metric-card">
               <span className="m-label">EVIDENCE</span>
               <span className="m-val">{routeResult?.evidence_state.route_state}</span>
               <span className="m-sub">weakest-link state</span>
@@ -1250,11 +1442,18 @@ const SafeRouteHud = ({
           {routeResult?.explanation?.length ? (
             <div className="route-comparison-note">{routeResult.explanation[0]}</div>
           ) : null}
+          {modelFrame && (
+            <div className="route-comparison-note">
+              {modelFrame}
+              {modelState?.model_timestamp ? ` · model time ${modelState.model_timestamp}` : ''}
+              {modelState?.forecast_acquired_at ? ` · acquired ${modelState.forecast_acquired_at}` : ''}
+            </div>
+          )}
           <div className="route-unavailable-warning">
             {routeResult && routeResult.mode === 'SCENARIO' ? (
               <>
-                WHAT-IF {routeResult.scenario.rainfall_mm_h} mm/h • peak modelled depth on this
-                route {Math.round(routeResult.max_depth_on_route_m * 100)} cm. Lowest exposure under a
+                WHAT-IF {routeResult.scenario.rainfall_mm_h ?? '—'} mm/h • peak modelled depth on this
+                route {routeResult.max_depth_on_route_m == null ? 'UNKNOWN' : `${Math.round(routeResult.max_depth_on_route_m * 100)} cm`}. Lowest exposure under a
                 hypothetical input — NOT live weather, NOT a guarantee of safety.
               </>
             ) : (

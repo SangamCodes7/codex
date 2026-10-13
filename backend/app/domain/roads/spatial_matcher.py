@@ -90,6 +90,9 @@ class OSMRoadNetworkCache:
                 "geom_32643_buffered": line_32643.buffer(7.0),  # 7m half-width buffer for road corridor
                 "length_m": line_32643.length,
                 "oneway": props.get("oneway"),
+                "access_tags": {key: str(props[key]).lower() for key in
+                                ("access", "foot", "motorcar", "motor_vehicle", "oneway:foot")
+                                if props.get(key) is not None},
             })
 
         # Load intersections

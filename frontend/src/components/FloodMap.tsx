@@ -10,6 +10,7 @@ setWorkerUrl(workerUrl);
 
 type ForecastHorizon = 'NOW' | '+1h' | '+2h' | '+3h';
 type AppMode = 'LIVE' | 'SCENARIO' | 'HISTORICAL';
+type TransportMode = 'car' | 'walk';
 type ScenarioValue = 20 | 40 | 50 | 70;
 const SCENARIO_VALUES: ScenarioValue[] = [20, 40, 50, 70];
 
@@ -186,23 +187,31 @@ interface SnappedPointAPI {
 
 interface ShortestPathComparisonAPI {
   distance_m: number;
-  max_flood_depth_m: number;
+  edge_ids: string[];
+  max_flood_depth_m: number | null;
   has_flooded_roads: boolean;
   flooded_road_count: number;
   geometry?: any | null;
 }
 
 interface SafeRouteAPIResponse {
-  status: 'SAFE' | 'CAUTION' | 'UNAVAILABLE' | 'NO_PATH_FOUND';
+  status: 'SAFE' | 'CAUTION' | 'UNAVAILABLE' | 'NO_PATH_FOUND' | 'UNKNOWN';
   total_distance_m: number;
-  estimated_travel_cost: number;
-  max_predicted_flood_depth_m: number;
+  estimated_travel_cost: number | null;
+  max_predicted_flood_depth_m: number | null;
   roads_avoided: string[];
   route_geometry: any;
   shortest_path_comparison?: ShortestPathComparisonAPI | null;
   start_snapped_to?: SnappedPointAPI | null;
   end_snapped_to?: SnappedPointAPI | null;
   provenance?: Record<string, string> | null;
+  transport_mode: TransportMode;
+  safety_classification: 'LOWER_RISK' | 'CAUTION' | 'UNKNOWN' | 'NO_SAFE_ROUTE';
+  uncertainty_count: number;
+  explanation: string;
+  model_state?: Record<string, any>;
+  transport_policy?: Record<string, any>;
+  route_edge_ids: string[];
 }
 
 interface HorizonData {
@@ -399,6 +408,7 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
   const [routeLoading, setRouteLoading] = useState<boolean>(false);
   const [routeError, setRouteError] = useState<string | null>(null);
   const routeRequestSeq = useRef<number>(0);
+  const [transportMode, setTransportMode] = useState<TransportMode>('car');
   const [mobileDrawerExpanded, setMobileDrawerExpanded] = useState<boolean>(true);
   const initialThemeOnMount = useRef(theme);
 
@@ -438,6 +448,8 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
   horizonsRef.current = horizons;
   const activeHorizonRef = useRef<ForecastHorizon>(activeHorizon);
   activeHorizonRef.current = activeHorizon;
+  const transportModeRef = useRef<TransportMode>('car');
+  transportModeRef.current = transportMode;
   const forecastDataRef = useRef<FloodForecastAPIResponse | null>(null);
   forecastDataRef.current = forecastData;
 
@@ -582,7 +594,8 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
     end: [number, number],
     horizonOverride?: ForecastHorizon,
     modeOverride?: AppMode,
-    scenarioOverride?: ScenarioValue
+    scenarioOverride?: ScenarioValue,
+    transportModeOverride?: TransportMode
   ) => {
     const seq = ++routeRequestSeq.current;
     setRouteLoading(true);
@@ -591,8 +604,10 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
       const hz = horizonOverride || activeHorizonRef.current;
       const mode = modeOverride || appModeRef.current;
       const sc = scenarioOverride || activeScenarioRef.current;
+      const tm = transportModeOverride || transportModeRef.current;
 
       let url = `/routing/safe-route?start_lon=${start[0]}&start_lat=${start[1]}&end_lon=${end[0]}&end_lat=${end[1]}&horizon=${encodeURIComponent(hz)}`;
+      url += `&transport_mode=${tm}`;
       if (mode === 'SCENARIO') {
         url += `&rainfall_scenario_mm=${sc}`;
       }
@@ -627,6 +642,8 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
   }, [updateRouteOnMap]);
 
   const handleClearRoute = useCallback(() => {
+    routeRequestSeq.current += 1;
+    setRouteLoading(false);
     setRouteOrigin(null);
     routeOriginRef.current = null;
     setRouteDestination(null);
@@ -635,6 +652,14 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
     setRouteError(null);
     updateRouteOnMap(null, null, null);
   }, [updateRouteOnMap]);
+
+  const handleSelectTransportMode = useCallback((nextMode: TransportMode) => {
+    setTransportMode(nextMode);
+    transportModeRef.current = nextMode;
+    if (routeOriginRef.current && routeDestinationRef.current) {
+      fetchSafeRoute(routeOriginRef.current, routeDestinationRef.current);
+    }
+  }, [fetchSafeRoute]);
 
   const handleToggleRouting = useCallback(() => {
     setIsRoutingActive((prev) => {
@@ -1700,8 +1725,13 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
     if (appMode !== 'HISTORICAL') return;
     if (!routeOriginRef.current || !routeDestinationRef.current) return;
     if (!historicalData) return;
+    routeRequestSeq.current += 1;
+    setRouteLoading(false);
+    setRouteResponse(null);
+    setRouteError(null);
+    updateRouteOnMap(null, routeOriginRef.current, routeDestinationRef.current);
     fetchSafeRoute(routeOriginRef.current, routeDestinationRef.current);
-  }, [appMode, historicalStep, historicalData, fetchSafeRoute]);
+  }, [appMode, historicalStep, historicalData, fetchSafeRoute, updateRouteOnMap]);
 
   // Handle horizon change
   const handleHorizonChange = (h: ForecastHorizon) => {
@@ -1710,6 +1740,11 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
     }
     setActiveHorizon(h);
     activeHorizonRef.current = h;
+    routeRequestSeq.current += 1;
+    setRouteLoading(false);
+    setRouteResponse(null);
+    setRouteError(null);
+    updateRouteOnMap(null, routeOriginRef.current, routeDestinationRef.current);
     if (appModeRef.current === 'LIVE') {
       applyHorizonToMap(h, forecastDataRef.current);
       applyStreetDataToMap(streetForecastDataRef.current?.[h] || null);
@@ -1725,6 +1760,11 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
       popupRef.current.remove();
     }
     setIsPlaying(false);
+    routeRequestSeq.current += 1;
+    setRouteLoading(false);
+    setRouteResponse(null);
+    setRouteError(null);
+    updateRouteOnMap(null, routeOriginRef.current, routeDestinationRef.current);
     setAppMode(mode);
     appModeRef.current = mode;
 
@@ -1785,6 +1825,11 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
       popupRef.current.remove();
     }
     const h = targetHorizon || SCENARIO_TO_HORIZON[sc] || '+1h';
+    routeRequestSeq.current += 1;
+    setRouteLoading(false);
+    setRouteResponse(null);
+    setRouteError(null);
+    updateRouteOnMap(null, routeOriginRef.current, routeDestinationRef.current);
     setActiveScenario(sc);
     activeScenarioRef.current = sc;
     setActiveHorizon(h);
@@ -2702,6 +2747,7 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
                     {routeResponse.status === 'CAUTION' && '⚠️ CAUTION'}
                     {routeResponse.status === 'UNAVAILABLE' && '⛔ UNAVAILABLE'}
                     {routeResponse.status === 'NO_PATH_FOUND' && '✕ NO PATH'}
+                    {routeResponse.status === 'UNKNOWN' && '? UNKNOWN'}
                   </span>
                 )}
                 <button
@@ -2752,6 +2798,31 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
               )}
             </div>
 
+            <div className="route-transport-selector">
+              <div className="presets-label">TRAVEL MODE</div>
+              <div className="presets-buttons">
+                <button
+                  type="button"
+                  className={`preset-btn ${transportMode === 'car' ? 'active' : ''}`}
+                  onClick={() => handleSelectTransportMode('car')}
+                  aria-pressed={transportMode === 'car'}
+                >
+                  🚗 Car
+                </button>
+                <button
+                  type="button"
+                  className={`preset-btn ${transportMode === 'walk' ? 'active' : ''}`}
+                  onClick={() => handleSelectTransportMode('walk')}
+                  aria-pressed={transportMode === 'walk'}
+                >
+                  🚶 Walk
+                </button>
+              </div>
+              <div className="route-mode-note">
+                V1 model screen: {transportMode === 'car' ? 'exclude ≥30 cm' : 'exclude ≥15 cm'}; not a safety guarantee.
+              </div>
+            </div>
+
             {/* Demo Corridor Presets (Instant 1-click test for Judges) */}
             <div className="route-presets-section">
               <div className="presets-label">DEMO CORRIDORS (KURLA PILOT)</div>
@@ -2784,7 +2855,7 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
                     <span className="m-val">
                       {(routeResponse.total_distance_m / 1000).toFixed(2)} <span className="m-unit">km</span>
                     </span>
-                    <span className="m-sub">{Math.round(routeResponse.total_distance_m)} m</span>
+                    <span className="m-sub">{routeResponse.total_distance_m.toFixed(1)} m from returned edges</span>
                   </div>
 
                   <div className="route-metric-card">
@@ -2796,7 +2867,7 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
                     </span>
                     <span className="m-sub">
                       {routeResponse.shortest_path_comparison
-                        ? `${Math.round(routeResponse.shortest_path_comparison.distance_m)} m direct`
+                         ? `${routeResponse.shortest_path_comparison.distance_m.toFixed(1)} m direct edges`
                         : ''}
                     </span>
                   </div>
@@ -2805,7 +2876,7 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
                     <span className="m-label">DETOUR DELTA</span>
                     <span className="m-val highlight">
                       {routeResponse.shortest_path_comparison
-                        ? `+${Math.max(0, Math.round(routeResponse.total_distance_m - routeResponse.shortest_path_comparison.distance_m))} m`
+                        ? `${routeResponse.total_distance_m - routeResponse.shortest_path_comparison.distance_m >= 0 ? '+' : ''}${(routeResponse.total_distance_m - routeResponse.shortest_path_comparison.distance_m).toFixed(1)} m`
                         : '--'}
                     </span>
                     <span className="m-sub">Safety penalty</span>
@@ -2813,8 +2884,10 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
 
                   <div className="route-metric-card">
                     <span className="m-label">MAX FLOOD DEPTH</span>
-                    <span className={`m-val ${routeResponse.max_predicted_flood_depth_m > 0 ? 'highlight-danger' : ''}`}>
-                      {Math.round(routeResponse.max_predicted_flood_depth_m * 100)} <span className="m-unit">cm</span>
+                    <span className={`m-val ${routeResponse.max_predicted_flood_depth_m != null && routeResponse.max_predicted_flood_depth_m > 0 ? 'highlight-danger' : ''}`}>
+                      {routeResponse.max_predicted_flood_depth_m == null
+                        ? 'UNKNOWN'
+                        : <>{Math.round(routeResponse.max_predicted_flood_depth_m * 100)} <span className="m-unit">cm</span></>}
                     </span>
                     <span className="m-sub">
                       deepest street along path
@@ -2842,7 +2915,14 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
                 {/* Shortest path traverse note */}
                 {routeResponse.shortest_path_comparison?.has_flooded_roads && routeResponse.status !== 'UNAVAILABLE' && (
                   <div className="route-comparison-note">
-                    ⚠️ Direct shortest path has {routeResponse.shortest_path_comparison.flooded_road_count} flooded road segment(s) (up to {Math.round(routeResponse.shortest_path_comparison.max_flood_depth_m * 100)} cm deep). Safe route detours to dry/passable streets.
+                    ⚠️ Direct shortest path has {routeResponse.shortest_path_comparison.flooded_road_count} flooded road segment(s)
+                    {routeResponse.shortest_path_comparison.max_flood_depth_m != null
+                      ? ` (up to ${Math.round(routeResponse.shortest_path_comparison.max_flood_depth_m * 100)} cm deep)`
+                      : ' with UNKNOWN depth'}.
+                    {' '}
+                    {routeResponse.status === 'UNKNOWN'
+                      ? 'The selected route still contains UNKNOWN hazard coverage; it is not a dry-road claim.'
+                      : 'The selected route detours to lower-exposure eligible streets.'}
                   </div>
                 )}
 
@@ -2854,8 +2934,16 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
 
                 <div className="route-comparison-note">
                   🗺️ Dashed grey = shortest path, solid coloured line = flood-safe route
-                  {routeResponse.shortest_path_comparison && Math.abs(routeResponse.total_distance_m - routeResponse.shortest_path_comparison.distance_m) < 0.5 ? ' (both coincide on this corridor)' : ''}.
-                  {' '}Hazard used: {routeResponse.provenance?.hazard_assessment || 'current flood hazard'}
+                  {routeResponse.shortest_path_comparison && routeResponse.route_edge_ids.length === routeResponse.shortest_path_comparison.edge_ids.length && routeResponse.route_edge_ids.every((edgeId, index) => edgeId === routeResponse.shortest_path_comparison?.edge_ids[index])
+                    ? ' (same directed graph edges)'
+                    : ' (distinct directed graph edges)'}.
+                  {' '}Mode: {routeResponse.transport_mode.toUpperCase()} · Hazard used: {routeResponse.provenance?.hazard_assessment || 'current flood hazard'}
+                </div>
+
+                <div className="route-comparison-note">
+                  {routeResponse.safety_classification}: {routeResponse.explanation}
+                  {routeResponse.uncertainty_count > 0 ? ` ${routeResponse.uncertainty_count} segment(s) remain uncertain.` : ''}
+                  {routeResponse.model_state?.model_state_id ? ` State: ${routeResponse.model_state.model_state_id}.` : ''}
                 </div>
 
                 {routeResponse.status === 'UNAVAILABLE' && (
@@ -2868,6 +2956,12 @@ const FloodMap = ({ theme }: FloodMapProps = {}) => {
                 {routeResponse.status === 'NO_PATH_FOUND' && (
                   <div className="route-unavailable-warning">
                     ⚠️ These two points are not connected by the mapped road network in this pilot area, so neither a shortest nor a flood-safe route can be drawn.
+                  </div>
+                )}
+
+                {routeResponse.status === 'UNKNOWN' && (
+                  <div className="route-unavailable-warning">
+                    ? The selected transport route has incomplete flood or access evidence. UNKNOWN is not treated as dry or safe.
                   </div>
                 )}
               </>

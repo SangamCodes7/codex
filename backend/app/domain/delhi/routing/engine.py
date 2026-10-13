@@ -27,7 +27,7 @@ import hashlib
 import heapq
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .network import DelhiRoadGraph, SegmentEdge, get_road_graph, road_network_provenance
 from .risk import (
@@ -41,6 +41,13 @@ from .risk import (
     translate_reach_to_road_risk,
 )
 from .state_source import ModeReachStates, now_utc
+from .transport import (
+    TransportRiskConfig,
+    assess_edge,
+    hazard_for_edge,
+    transport_config,
+    validate_transport_mode,
+)
 
 RISK_PENALTY_S_PER_M: Dict[RiskState, float] = {
     "LOW_RISK": 0.0,
@@ -61,6 +68,7 @@ MIN_DISTINCT_EDGE_FRACTION = 0.7
 class RouteCandidate:
     edges: List[SegmentEdge]
     risk_by_edge: Dict[str, Tuple[RiskState, str]] = field(default_factory=dict)
+    transport_by_edge: Dict[str, dict] = field(default_factory=dict)
     total_distance_m: float = 0.0
     travel_time_s: float = 0.0
     risk_penalty_s: float = 0.0
@@ -71,12 +79,20 @@ class RouteCandidate:
         return self.travel_time_s + self.risk_penalty_s
 
     def counts_summary(self) -> Dict[str, int]:
-        return {
+        summary = {
             "blocked": self.counts.get("BLOCKED", 0),
             "elevated_risk": self.counts.get("ELEVATED_RISK", 0),
             "unknown": self.counts.get("UNKNOWN", 0),
             "low_risk": self.counts.get("LOW_RISK", 0),
         }
+        if self.transport_by_edge:
+            summary["uncertain"] = sum(
+                1 for record in self.transport_by_edge.values() if record.get("uncertain")
+            )
+            summary["hazardous"] = sum(
+                1 for record in self.transport_by_edge.values() if record.get("hazardous")
+            )
+        return summary
 
 
 def _edge_risk_states(
@@ -145,6 +161,174 @@ def _dijkstra(
         cur = u
     edges.reverse()
     return edges
+
+
+def _transport_assessments(
+    graph: DelhiRoadGraph,
+    transport_mode: str,
+    base_risk_by_edge: Mapping[str, Tuple[RiskState, str]],
+    edge_hazards: Optional[Mapping[str, Any]],
+    config: TransportRiskConfig,
+) -> Dict[str, dict]:
+    """Build the immutable per-edge transport decision table.
+
+    The table is deliberately separate from the Dijkstra loop.  This makes
+    the access and hazard decisions inspectable in the response and prevents
+    a missing hazard record from being accidentally treated as dry pavement.
+    """
+
+    assessments: Dict[str, dict] = {}
+    for edge_key, edge in graph.edge_index.items():
+        base_risk, base_reason = base_risk_by_edge.get(
+            edge_key,
+            ("UNKNOWN", "no flood-risk translation for this graph edge"),
+        )
+        hazard, has_record = hazard_for_edge(edge_key, edge_hazards)
+        assessments[edge_key] = assess_edge(
+            edge=edge,
+            mode=transport_mode,
+            base_risk=base_risk,
+            base_reason=base_reason,
+            hazard=hazard,
+            has_hazard_record=has_record,
+            config=config,
+        )
+    return assessments
+
+
+def _transport_dijkstra(
+    graph: DelhiRoadGraph,
+    source: int,
+    target: int,
+    assessments: Mapping[str, dict],
+    config: TransportRiskConfig,
+    cost_multiplier_by_road: Optional[Dict[str, float]] = None,
+) -> Optional[List[SegmentEdge]]:
+    """Deterministic Dijkstra with access filtering and mode-specific costs."""
+
+    multiplier = cost_multiplier_by_road or {}
+    dist: Dict[int, float] = {source: 0.0}
+    prev: Dict[int, Tuple[int, str]] = {}
+    visited = set()
+    heap: List[Tuple[float, int]] = [(0.0, source)]
+    while heap:
+        current_cost, u = heapq.heappop(heap)
+        if u in visited:
+            continue
+        visited.add(u)
+        if u == target:
+            break
+        for edge in graph.adj.get(u, ()):
+            if edge.v in visited:
+                continue
+            decision = assessments.get(edge.edge_key)
+            if not decision or decision["blocked"]:
+                continue
+            risk = decision["risk_state"]
+            base_penalty = RISK_PENALTY_S_PER_M.get(risk, RISK_PENALTY_S_PER_M["UNKNOWN"])
+            if decision.get("hazardous"):
+                base_penalty = max(base_penalty, config.hazard_penalty_s_per_m)
+            if decision.get("uncertain"):
+                base_penalty = max(base_penalty, config.uncertainty_penalty_s_per_m)
+            cost = graph.travel_time_s(edge) + base_penalty * edge.length_m
+            cost *= multiplier.get(edge.road_id, 1.0)
+            next_cost = current_cost + cost
+            if next_cost < dist.get(edge.v, float("inf")) - 1e-12:
+                dist[edge.v] = next_cost
+                prev[edge.v] = (u, edge.edge_key)
+                heapq.heappush(heap, (next_cost, edge.v))
+    if target not in dist:
+        return None
+    path: List[SegmentEdge] = []
+    current = target
+    while current != source:
+        parent, edge_key = prev[current]
+        path.append(graph.edge_index[edge_key])
+        current = parent
+    path.reverse()
+    return path
+
+
+def _build_transport_candidate(
+    edges: List[SegmentEdge],
+    assessments: Mapping[str, dict],
+    config: TransportRiskConfig,
+) -> RouteCandidate:
+    candidate = RouteCandidate(edges=edges)
+    for edge in edges:
+        decision = dict(assessments[edge.edge_key])
+        candidate.transport_by_edge[edge.edge_key] = decision
+        risk = decision["risk_state"]
+        reason = decision["reason"]
+        candidate.risk_by_edge[edge.edge_key] = (risk, reason)
+        candidate.total_distance_m += edge.length_m
+        penalty = RISK_PENALTY_S_PER_M.get(risk, RISK_PENALTY_S_PER_M["UNKNOWN"])
+        if decision.get("hazardous"):
+            penalty = max(penalty, config.hazard_penalty_s_per_m)
+        if decision.get("uncertain"):
+            penalty = max(penalty, config.uncertainty_penalty_s_per_m)
+        candidate.risk_penalty_s += penalty * edge.length_m
+        candidate.counts[risk] = candidate.counts.get(risk, 0) + 1
+    candidate.travel_time_s = sum(get_road_graph().travel_time_s(edge) for edge in edges)
+    return candidate
+
+
+def _validate_route_continuity(edges: List[SegmentEdge]) -> None:
+    """Reject malformed paths before they reach GeoJSON or the map."""
+
+    for previous, current in zip(edges, edges[1:]):
+        if previous.v != current.u:
+            raise ValueError("ROUTE_INVALID: returned edges are not topologically continuous")
+
+
+def _transport_classification(candidate: RouteCandidate) -> Tuple[str, str]:
+    counts = candidate.counts_summary()
+    if counts.get("uncertain", 0) or counts.get("unknown", 0):
+        return "UNKNOWN", (
+            "required transport hazard or access evidence is missing on one or more "
+            "route segments; UNKNOWN is not treated as safe"
+        )
+    if counts.get("hazardous", 0) or counts.get("elevated_risk", 0):
+        return "CAUTION", "the route remains eligible but includes elevated modeled exposure"
+    return "LOWER_RISK", (
+        "no configured mode-specific exclusion or elevated hazard criterion was "
+        "met on the eligible route; this is not a safety guarantee"
+    )
+
+
+def _transport_explanation(
+    mode: str,
+    candidate: RouteCandidate,
+    classification: str,
+    reason: str,
+    alternative: Optional[RouteCandidate],
+    no_alternative_reason: Optional[str],
+) -> List[str]:
+    counts = candidate.counts_summary()
+    lines = [
+        f"{mode.title()} routing used mode-specific access rules and flood penalties.",
+        f"Route classification: {classification} — {reason}.",
+    ]
+    if counts.get("hazardous", 0):
+        lines.append(f"{counts['hazardous']} segment(s) carry elevated modeled exposure for {mode}.")
+    if counts.get("uncertain", 0):
+        lines.append(
+            f"{counts['uncertain']} segment(s) have uncertain access or hazard inputs; "
+            "missing velocity is UNKNOWN, not zero."
+        )
+    if alternative is not None:
+        delta = (alternative.total_distance_m - candidate.total_distance_m) / 1000.0
+        lines.append(
+            f"The alternative is {abs(delta):.2f} km "
+            f"{'longer' if delta >= 0 else 'shorter'} under the same active model state."
+        )
+    elif no_alternative_reason:
+        lines.append(f"No distinct alternative: {no_alternative_reason}.")
+    lines.append(
+        "The underlying Delhi network has no surveyed pedestrian facilities, verified "
+        "road-closure feed, or road-water velocity field; use this as a modeled screening result."
+    )
+    return lines
 
 
 def _build_candidate(
@@ -250,15 +434,268 @@ def _explain(
     return lines
 
 
+def _compute_transport_route(
+    *,
+    graph: DelhiRoadGraph,
+    origin_lon: float,
+    origin_lat: float,
+    dest_lon: float,
+    dest_lat: float,
+    transport_mode: str,
+    mode_states: Optional[ModeReachStates],
+    model_timestamp: Optional[str],
+    forcing_source: Optional[str],
+    mode_freshness_note: str,
+    edge_hazards: Optional[Mapping[str, Any]],
+    state_provenance: Optional[Mapping[str, Any]],
+    config_overrides: Optional[Mapping[str, Any]],
+) -> dict:
+    """Transport branch of the same Delhi routing engine."""
+
+    normalized = validate_transport_mode(transport_mode)
+    assert normalized is not None
+    config = transport_config(normalized, config_overrides)
+    o_idx, o_dist, o_name = graph.snap(origin_lon, origin_lat)
+    d_idx, d_dist, d_name = graph.snap(dest_lon, dest_lat)
+
+    if mode_states is not None and mode_states.status in ("COMPUTED", "EXECUTED") and mode_states.member_states:
+        base_risk = _edge_risk_states(mode_states)
+        status = "COMPUTED"
+    elif mode_states is None and edge_hazards is not None:
+        # Scenario surface products can provide a complete edge-level hazard
+        # field without passing through the 1-D reach adapter.  Start from a
+        # computed/no-loading base and let the transport hazard table apply
+        # depth, velocity, and UNKNOWN rules per edge.
+        base_risk = {
+            edge_key: ("LOW_RISK", "edge-level surface hazard field supplied for this frame")
+            for edge_key in graph.edge_index
+        }
+        status = "COMPUTED"
+    else:
+        base_risk = {
+            edge_key: (
+                "UNKNOWN",
+                "hydraulic model state unavailable for this route frame",
+            )
+            for edge_key in graph.edge_index
+        }
+        status = "UNKNOWN_RISK_STATE"
+
+    assessments = _transport_assessments(
+        graph, normalized, base_risk, edge_hazards, config
+    )
+    edges = _transport_dijkstra(graph, o_idx, d_idx, assessments, config)
+
+    state_meta = dict(state_provenance or {})
+    if state_meta.get("state_id") is None and state_meta.get("routing_state_id") is not None:
+        state_meta["state_id"] = state_meta["routing_state_id"]
+    state_meta.setdefault("mode", mode_states.mode if mode_states else "UNKNOWN")
+    state_meta.setdefault("event_id", mode_states.event_id if mode_states else None)
+    state_meta.setdefault("timestep_index", mode_states.timestep_index if mode_states else None)
+    state_meta.setdefault("model_timestamp", model_timestamp)
+    state_meta.setdefault("forcing_source", forcing_source)
+    state_meta.setdefault("data_freshness", mode_freshness_note)
+    state_meta.setdefault("city", "delhi")
+    state_meta.setdefault("model_version", "Delhi/Kushak Phase 8B evidence-constrained routing")
+    state_meta.setdefault("transport_mode", normalized)
+
+    def empty_response(reason: str) -> dict:
+        run_id = hashlib.sha256(
+            repr((normalized, state_meta, round(origin_lon, 6), round(origin_lat, 6),
+                 round(dest_lon, 6), round(dest_lat, 6), "NO_SAFE_ROUTE")).encode()
+        ).hexdigest()[:16]
+        return {
+            "status": status,
+            "mode": mode_states.mode if mode_states else state_meta.get("mode", "UNKNOWN"),
+            "event_id": mode_states.event_id if mode_states else state_meta.get("event_id"),
+            "timestep_index": mode_states.timestep_index if mode_states else state_meta.get("timestep_index"),
+            "transport_mode": normalized,
+            "route_run_id": run_id,
+            "generated_at": now_utc().isoformat(),
+            "origin": {"coords": [origin_lon, origin_lat], "snapped_road": o_name, "snap_distance_m": round(o_dist, 1)},
+            "destination": {"coords": [dest_lon, dest_lat], "snapped_road": d_name, "snap_distance_m": round(d_dist, 1)},
+            "recommended_route": None,
+            "alternative_route": None,
+            "no_alternative_reason": reason,
+            "route_comparison": {"recommended": None, "alternative": None},
+            "evidence_state": {"route_state": "NO_SAFE_ROUTE", "reason": reason, "derivation": "all ineligible, blocked, or disconnected transport edges were excluded"},
+            "safety_classification": "NO_SAFE_ROUTE",
+            "explanation": [
+                f"No eligible {normalized} route satisfies the configured access and flood constraints.",
+                reason,
+                "The system did not return an unsafe route relabeled as safe.",
+            ],
+            "claim_policy": "No safe route was established for this transport mode and active model state.",
+            "model_state": state_meta,
+            "provenance": {
+                "transport_mode": normalized,
+                "transport_risk_configuration": config.as_metadata(),
+                "road_network_source": road_network_provenance().get("source"),
+                "risk_mapping_method": "mode-specific access plus depth/velocity/uncertainty edge assessment",
+                "velocity_data": "UNKNOWN when not supplied; never assumed zero",
+                "model_state": state_meta,
+                "data_freshness": mode_freshness_note,
+            },
+            "data_freshness": {
+                "note": mode_freshness_note,
+                "rainfall_updated_at": state_meta.get("forecast_acquired_at"),
+                "hydraulic_run_updated_at": model_timestamp,
+                "road_network_updated_at": None,
+                "observation_updated_at": None,
+            },
+        }
+
+    if edges is None:
+        return empty_response(
+            "origin and destination are disconnected after excluding ineligible or confirmed impassable segments"
+        )
+    _validate_route_continuity(edges)
+    recommended = _build_transport_candidate(edges, assessments, config)
+
+    multiplier = {edge.road_id: ALTERNATIVE_DIVERGENCE_FACTOR for edge in recommended.edges}
+    alt_edges = _transport_dijkstra(graph, o_idx, d_idx, assessments, config, multiplier)
+    alternative: Optional[RouteCandidate] = None
+    no_alt_reason: Optional[str] = None
+    if alt_edges is None:
+        no_alt_reason = "no connected alternative avoiding the recommended corridor"
+    else:
+        _validate_route_continuity(alt_edges)
+        alt_candidate = _build_transport_candidate(alt_edges, assessments, config)
+        rec_roads = {edge.road_id for edge in recommended.edges}
+        alt_roads = {edge.road_id for edge in alt_candidate.edges}
+        shared = len(rec_roads & alt_roads)
+        denom = max(len(rec_roads | alt_roads), 1)
+        if 1.0 - (shared / denom) >= (1.0 - MIN_DISTINCT_EDGE_FRACTION):
+            alternative = alt_candidate
+        else:
+            no_alt_reason = "the best alternative is not sufficiently distinct from the recommended route"
+
+    classification, class_reason = _transport_classification(recommended)
+    counts = recommended.counts_summary()
+    covered = sum(1 for edge in recommended.edges if not recommended.transport_by_edge[edge.edge_key].get("uncertain"))
+    evidence_state, evidence_reason = route_evidence_state(
+        total_edges=len(recommended.edges),
+        covered_edges=covered,
+        has_unknown_on_route=counts.get("unknown", 0) > 0 or counts.get("uncertain", 0) > 0,
+        member_disagreement=False,
+    )
+
+    def route_payload(candidate: RouteCandidate) -> dict:
+        c = candidate.counts_summary()
+        depths = [
+            record.get("depth_m")
+            for record in candidate.transport_by_edge.values()
+            if record.get("depth_m") is not None
+        ]
+        velocities = [
+            record.get("velocity_m_s")
+            for record in candidate.transport_by_edge.values()
+            if record.get("velocity_m_s") is not None
+        ]
+        route_class, _ = _transport_classification(candidate)
+        risk_features = []
+        for edge in candidate.edges:
+            decision = candidate.transport_by_edge[edge.edge_key]
+            if decision["risk_state"] != "LOW_RISK" or decision.get("uncertain"):
+                risk_features.append({
+                    "type": "Feature",
+                    "properties": {
+                        "segment_id": edge.edge_key,
+                        "risk_state": decision["risk_state"],
+                        "name": edge.name,
+                        "reason": decision["reason"],
+                        "depth_m": decision.get("depth_m"),
+                        "velocity_m_s": decision.get("velocity_m_s"),
+                        "uncertain": decision.get("uncertain", False),
+                    },
+                    "geometry": {"type": "LineString", "coordinates": [list(edge.coords_4326[0]), list(edge.coords_4326[1])]},
+                })
+        return {
+            "edges": [edge.edge_key for edge in candidate.edges],
+            "geometry": _route_geojson(candidate.edges),
+            "risk_segments": {"type": "FeatureCollection", "features": risk_features},
+            "total_distance_km": round(candidate.total_distance_m / 1000.0, 2),
+            # Current speeds are class assumptions, not transport-specific ETA
+            # evidence.  Keep the existing legacy estimate out of this branch.
+            "estimated_travel_time_min": None,
+            "flood_risk_summary": {
+                "blocked_segments": c.get("blocked", 0),
+                "elevated_risk_segments": c.get("elevated_risk", 0),
+                "unknown_segments": c.get("unknown", 0),
+                "uncertain_segments": c.get("uncertain", 0),
+                "hazardous_segments": c.get("hazardous", 0),
+                "low_risk_segments": c.get("low_risk", 0),
+            },
+            "route_state": route_class,
+            "safety_classification": route_class,
+            "max_depth_m": round(max(depths), 3) if depths else None,
+            "max_velocity_m_s": round(max(velocities), 3) if velocities else None,
+            "risk_penalty_s": round(candidate.risk_penalty_s, 1),
+        }
+
+    route_run_id = hashlib.sha256(
+        repr((normalized, config.as_metadata(), state_meta, round(origin_lon, 6), round(origin_lat, 6),
+             round(dest_lon, 6), round(dest_lat, 6), [edge.edge_key for edge in recommended.edges])).encode()
+    ).hexdigest()[:16]
+    rec_payload = route_payload(recommended)
+    alt_payload = route_payload(alternative) if alternative else None
+    return {
+        "status": status,
+        "mode": mode_states.mode if mode_states else state_meta.get("mode", "UNKNOWN"),
+        "event_id": mode_states.event_id if mode_states else state_meta.get("event_id"),
+        "timestep_index": mode_states.timestep_index if mode_states else state_meta.get("timestep_index"),
+        "transport_mode": normalized,
+        "route_run_id": route_run_id,
+        "generated_at": now_utc().isoformat(),
+        "origin": {"coords": [origin_lon, origin_lat], "snapped_road": o_name, "snap_distance_m": round(o_dist, 1)},
+        "destination": {"coords": [dest_lon, dest_lat], "snapped_road": d_name, "snap_distance_m": round(d_dist, 1)},
+        "recommended_route": rec_payload,
+        "alternative_route": alt_payload,
+        "no_alternative_reason": no_alt_reason,
+        "route_comparison": {
+            "recommended": {**{k: v for k, v in rec_payload["flood_risk_summary"].items()}, "distance_km": rec_payload["total_distance_km"], "travel_time_min": None, "risk_penalty_s": rec_payload["risk_penalty_s"]},
+            "alternative": ({**{k: v for k, v in alt_payload["flood_risk_summary"].items()}, "distance_km": alt_payload["total_distance_km"], "travel_time_min": None, "risk_penalty_s": alt_payload["risk_penalty_s"]} if alt_payload else None),
+        },
+        "evidence_state": {"route_state": evidence_state, "reason": evidence_reason, "derivation": "transport access and hazard evidence use a weakest-link rule; UNKNOWN is never averaged into safety"},
+        "safety_classification": classification,
+        "explanation": _transport_explanation(normalized, recommended, classification, class_reason, alternative, no_alt_reason),
+        "claim_policy": (
+            f"{normalized.title()} route with the lowest supported modeled flood exposure under the active state. "
+            "LOWER_RISK is not a guarantee; missing pedestrian facilities, verified closures, and velocity remain explicit limitations."
+        ),
+        "model_state": state_meta,
+        "provenance": {
+            "transport_mode": normalized,
+            "transport_risk_configuration": config.as_metadata(),
+            "road_network_source": road_network_provenance().get("source"),
+            "risk_mapping_method": "mode-specific access plus depth/velocity/uncertainty edge assessment",
+            "velocity_data": "UNKNOWN when not supplied; never assumed zero",
+            "model_state": state_meta,
+            "data_freshness": mode_freshness_note,
+        },
+        "data_freshness": {
+            "note": mode_freshness_note,
+            "rainfall_updated_at": state_meta.get("forecast_acquired_at"),
+            "hydraulic_run_updated_at": model_timestamp,
+            "road_network_updated_at": None,
+            "observation_updated_at": None,
+        },
+    }
+
+
 def compute_safe_route(
     origin_lon: float,
     origin_lat: float,
     dest_lon: float,
     dest_lat: float,
-    mode_states: ModeReachStates,
-    model_timestamp: Optional[str],
-    forcing_source: Optional[str],
-    mode_freshness_note: str,
+    mode_states: Optional[ModeReachStates] = None,
+    model_timestamp: Optional[str] = None,
+    forcing_source: Optional[str] = None,
+    mode_freshness_note: str = "",
+    transport_mode: Optional[str] = None,
+    edge_hazards: Optional[Mapping[str, Any]] = None,
+    state_provenance: Optional[Mapping[str, Any]] = None,
+    transport_config_overrides: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """Compute the full flood-aware routing result for ONE mode.
 
@@ -268,6 +705,24 @@ def compute_safe_route(
     messages.
     """
     graph = get_road_graph()
+    if transport_mode is not None:
+        return _compute_transport_route(
+            graph=graph,
+            origin_lon=origin_lon,
+            origin_lat=origin_lat,
+            dest_lon=dest_lon,
+            dest_lat=dest_lat,
+            transport_mode=transport_mode,
+            mode_states=mode_states,
+            model_timestamp=model_timestamp,
+            forcing_source=forcing_source,
+            mode_freshness_note=mode_freshness_note,
+            edge_hazards=edge_hazards,
+            state_provenance=state_provenance,
+            config_overrides=transport_config_overrides,
+        )
+    if mode_states is None:
+        raise ValueError("mode_states is required for legacy flood-safe routing")
     o_idx, o_dist, o_name = graph.snap(origin_lon, origin_lat)
     d_idx, d_dist, d_name = graph.snap(dest_lon, dest_lat)
 

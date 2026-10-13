@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from shapely.geometry import Point
 from shapely.strtree import STRtree
 from rasterio.warp import transform
@@ -11,9 +11,11 @@ from rasterio.warp import transform
 try:
     from backend.app.domain.roads.spatial_matcher import OSMRoadNetworkCache
     from backend.app.domain.routing.models import SnappedPoint
+    from backend.app.domain.routing.transport import edge_access
 except ImportError:
     from app.domain.roads.spatial_matcher import OSMRoadNetworkCache
     from app.domain.routing.models import SnappedPoint
+    from app.domain.routing.transport import edge_access
 
 
 @dataclass
@@ -28,6 +30,7 @@ class EdgeData:
     length_m: float
     coords_4326: List[List[float]]
     oneway: bool = False
+    access_tags: Dict[str, str] = field(default_factory=dict)
 
 
 class RoadGraph:
@@ -44,6 +47,8 @@ class RoadGraph:
         self.node_list: List[Tuple[float, float, float, float]] = []  # (lon, lat, x_32643, y_32643)
         self.node_lookup: Dict[Tuple[float, float], int] = {}
         self.adj: Dict[int, List[EdgeData]] = {}
+        self.walk_adj: Dict[int, List[EdgeData]] = {}
+        self._mode_trees = {}
         self.edge_by_road: Dict[str, List[EdgeData]] = {}
         self._tree: Optional[STRtree] = None
         self._node_points_32643: List[Point] = []
@@ -62,6 +67,7 @@ class RoadGraph:
             self.node_lookup[key] = idx
             self.node_list.append((lon, lat, x, y))
             self.adj[idx] = []
+            self.walk_adj[idx] = []
         return self.node_lookup[key]
 
     def _build_graph(self):
@@ -85,7 +91,7 @@ class RoadGraph:
                 self.edge_by_road[road_id] = []
 
             oneway = r.get("oneway")
-            is_oneway_fwd = (oneway == "yes")
+            is_oneway_fwd = (oneway in ("yes", "1", "true"))
             is_oneway_rev = (oneway == "-1")
 
             for i in range(len(node_ids) - 1):
@@ -107,6 +113,7 @@ class RoadGraph:
                     length_m=seg_len,
                     coords_4326=[c4326[i], c4326[i + 1]],
                     oneway=is_oneway_fwd,
+                    access_tags=r.get("access_tags", {}),
                 )
                 rev_edge = EdgeData(
                     u=v,
@@ -118,7 +125,15 @@ class RoadGraph:
                     length_m=seg_len,
                     coords_4326=[c4326[i + 1], c4326[i]],
                     oneway=is_oneway_rev,
+                    access_tags=r.get("access_tags", {}),
                 )
+
+                # Vehicle one-ways do not imply pedestrian one-ways.
+                foot_oneway = r.get("access_tags", {}).get("oneway:foot")
+                if foot_oneway != "-1":
+                    self.walk_adj[u].append(fwd_edge)
+                if foot_oneway not in {"yes", "1", "true"}:
+                    self.walk_adj[v].append(rev_edge)
 
                 if is_oneway_fwd:
                     self.adj[u].append(fwd_edge)
@@ -136,7 +151,7 @@ class RoadGraph:
         self._node_points_32643 = [Point(n[2], n[3]) for n in self.node_list]
         self._tree = STRtree(self._node_points_32643)
 
-    def snap_coordinate(self, lon: float, lat: float, max_dist_m: float = 1500.0) -> Tuple[int, SnappedPoint]:
+    def snap_coordinate(self, lon: float, lat: float, max_dist_m: float = 1500.0, transport_mode: str = "car") -> Tuple[int, SnappedPoint]:
         """
         Snap an input WGS84 coordinate to the nearest road network node.
         
@@ -157,7 +172,22 @@ class RoadGraph:
         xs, ys = transform("EPSG:4326", "EPSG:32643", [lon], [lat])
         pt_32643 = Point(xs[0], ys[0])
 
-        nearest_idx = int(self._tree.nearest(pt_32643))
+        adjacency = self.walk_adj if transport_mode == "walk" else self.adj
+        if transport_mode not in {"car", "walk"}:
+            nearest_idx = int(self._tree.nearest(pt_32643))
+        elif transport_mode not in self._mode_trees:
+            nodes = sorted({n for edges in adjacency.values() for edge in edges
+                            if edge_access(edge, transport_mode)[0] for n in (edge.u, edge.v)})
+            tree = STRtree([self._node_points_32643[n] for n in nodes])
+            self._mode_trees[transport_mode] = (nodes, tree)
+            if not nodes:
+                raise ValueError(f"No mapped roads eligible for {transport_mode} in the Mumbai pilot")
+            nearest_idx = nodes[int(tree.nearest(pt_32643))]
+        else:
+            nodes, tree = self._mode_trees[transport_mode]
+            if not nodes:
+                raise ValueError(f"No mapped roads eligible for {transport_mode} in the Mumbai pilot")
+            nearest_idx = nodes[int(tree.nearest(pt_32643))]
         nearest_node = self.node_list[nearest_idx]
         dist_m = float(pt_32643.distance(self._node_points_32643[nearest_idx]))
 
@@ -168,7 +198,10 @@ class RoadGraph:
             )
 
         # Identify closest road name
-        connected_edges = self.adj.get(nearest_idx, [])
+        connected_edges = [
+            e for e in adjacency.get(nearest_idx, [])
+            if transport_mode not in {"car", "walk"} or edge_access(e, transport_mode)[0]
+        ]
         nearest_road_name = connected_edges[0].name if connected_edges else "Unnamed Street"
 
         snapped = SnappedPoint(

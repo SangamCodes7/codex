@@ -96,6 +96,10 @@ from backend.app.domain.delhi.routing.state_source import (
     get_historical_timestep_count,
     get_live_reach_states,
 )
+from backend.app.domain.delhi.routing.transport import (
+    normalize_hazard,
+    validate_transport_mode,
+)
 from backend.app.domain.delhi.science.gating import production_mode
 from backend.app.domain.delhi.science.ml_pipeline import production_gate
 from backend.app.domain.delhi.science.validation import evaluate_quantitative_validation
@@ -126,9 +130,11 @@ from backend.app.domain.delhi.scenarios.depth_v1 import (
     V1DepthStep,
     depth_cells_from_v1,
     depth_polygons_from_v1,
+    road_depths_from_v1,
     scenario_v1_depth_steps,
 )
 from backend.app.domain.delhi.scenarios.config import ScenarioDefinition, StormTemporalProfile
+from backend.app.domain.delhi.scenarios.engine import load_scenario_result
 from backend.app.domain.delhi.surface import (
     get_surface_structure,
     INFILTRATION_MM_H,
@@ -760,6 +766,7 @@ def get_event_depth_grid(
         description="Run the V1 depth replay on the 24-h NWP-completed "
         "event-day forcing instead of the documented-only bins",
     ),
+    include_routing: bool = False,
 ) -> Dict[str, Any]:
     """V1-reference flood depth grid for a HISTORICAL event's forcing bin
     (like the Mumbai 2017 replay depth maps, ported to V2).
@@ -797,7 +804,7 @@ def get_event_depth_grid(
         prov_list = [b["provenance"] for b in cbins]
         src_list = [b["source"] for b in cbins]
         step_labels = [f"{int(b['hour_of_day']):02d}:00 IST" for b in cbins]
-        cache_key = f"depthgrid24:{event_id}"
+        cache_key = f"depthgrid24:{event_id}:{'routing' if include_routing else 'display'}"
         completion_meta = {
             "status": block["status"],
             "event_day_ist": block["event_day_ist"],
@@ -820,7 +827,10 @@ def get_event_depth_grid(
             src_list.append("DOCUMENTED_CATALOG")
             step_labels.append(f"H+{cum_h:.0f}h")
             cum_h += h
-        cache_key = f"depthgrid:{event_id}:{timestep_index}"
+        cache_key = (
+            f"depthgrid:{event_id}:{timestep_index}:"
+            f"{'routing' if include_routing else 'display'}"
+        )
         completion_meta = None
 
     if timestep_index >= len(bins_meta):
@@ -831,6 +841,11 @@ def get_event_depth_grid(
     def _assemble_depth_payload(
         step_list: List[Dict[str, Any]], idx: int
     ) -> Dict[str, Any]:
+        selected_step = dict(step_list[idx])
+        selected_step["routing_state_id"] = (
+            f"HISTORICAL:{event_id}:{idx}:"
+            f"{'24H' if complete_24h else 'DOCUMENTED'}"
+        )
         payload: Dict[str, Any] = {
             "event_id": event_id,
             "canonical_event_id": resolved,
@@ -847,9 +862,12 @@ def get_event_depth_grid(
                 f"ASSUMED infiltration ({INFILTRATION_MM_H} mm/h), so the "
                 "replay drains over time instead of resetting every hour."
             ),
-            "step": step_list[idx],
+            "step": selected_step,
             "steps_summary": [
-                {k: v for k, v in st.items() if k not in ("depth_cells", "streets")}
+                {
+                    k: v for k, v in st.items()
+                    if k not in ("depth_cells", "streets", "_routing_road_depths")
+                }
                 for st in step_list
             ],
             "generated_at": _iso(datetime.now(timezone.utc)),
@@ -904,6 +922,35 @@ def get_event_depth_grid(
     from backend.app.domain.delhi.live_state import _street_intelligence
     import numpy as _np
 
+    routing_graph = get_road_graph() if include_routing else None
+    routing_edge_midpoints = (
+        {
+            edge_key: (
+                (routing_graph.node_lonlat[edge.u][0] + routing_graph.node_lonlat[edge.v][0]) / 2.0,
+                (routing_graph.node_lonlat[edge.u][1] + routing_graph.node_lonlat[edge.v][1]) / 2.0,
+            )
+            for edge_key, edge in routing_graph.edge_index.items()
+        }
+        if routing_graph is not None
+        else {}
+    )
+
+    def unknown_routing_depths() -> Dict[str, dict]:
+        if routing_graph is None:
+            return {}
+        return {
+            edge_key: {
+                "road_segment_id": edge_key,
+                "depth_cm": None,
+                "depth_m": None,
+                "water_depth_state": "UNKNOWN",
+                "source_type": "UNKNOWN_FORCING",
+                "match_method": "active replay frame has no defensible forcing state",
+                "uncertainty": "UNKNOWN — no zero-fill",
+            }
+            for edge_key in routing_graph.edge_index
+        }
+
     cell_area = structure.cell_area_m2
     n_cells = structure.cell_flat_idx.size
     cap_m = _np.where(structure.depression_cap_m > 0.15, structure.depression_cap_m, 0.10)
@@ -938,6 +985,8 @@ def get_event_depth_grid(
                     "depth_cells": [],
                     "source_type": "SIMULATED_MODEL_OUTPUT",
                 })
+                if include_routing:
+                    steps[-1]["_routing_road_depths"] = unknown_routing_depths()
                 step_objs.append(None)
                 step_grids.append(_np.zeros(n_cells))
                 continue
@@ -976,6 +1025,12 @@ def get_event_depth_grid(
                 ),
                 "source_type": "SIMULATED_MODEL_OUTPUT",
             })
+            if include_routing:
+                # The forcing is UNKNOWN even though the replay surface is
+                # carried forward as a documented recession estimate.  Route
+                # safety therefore remains UNKNOWN rather than treating the
+                # recession proxy as a verified dry-road observation.
+                steps[-1]["_routing_road_depths"] = unknown_routing_depths()
             step_objs.append(st)
             step_grids.append(st.depth_m)
             standing_prev = receded
@@ -1039,6 +1094,10 @@ def get_event_depth_grid(
             },
             "source_type": "SIMULATED_MODEL_OUTPUT",
         })
+        if include_routing:
+            steps[-1]["_routing_road_depths"] = road_depths_from_v1(
+                st, structure, routing_edge_midpoints
+            )
         step_objs.append(st)
         step_grids.append(st.depth_m)
         standing_prev = water
@@ -1062,6 +1121,7 @@ def get_event_depth_grid(
         # Documented catalog hours keep their labels untouched; archive
         # hours are promoted to the explicit NWP completion class.
         for i, st in enumerate(steps):
+            st["time_start"] = cbins[i]["time_start"]
             st["rainfall_source"] = src_list[i]
             if src_list[i] == "OPEN_METEO_ARCHIVE":
                 st["rainfall_provenance"] = "NWP_HISTORICAL_COMPLETION"
@@ -1608,6 +1668,13 @@ def get_safe_route(
     departure_hour: int = Query(0, ge=0, le=3, description="LIVE mode: 0-3h forecast hour"),
     event_id: Optional[str] = Query(None, description="HISTORICAL mode: catalogue event id"),
     timestep_index: int = Query(0, ge=0, description="HISTORICAL mode: replay timestep"),
+    transport_mode: Optional[str] = Query(None, description="Transport mode: car or walk"),
+    model_state_id: Optional[str] = Query(None, description="Exact active model-state identity"),
+    complete_24h: bool = Query(False, description="Historical replay completion flag"),
+    client_rainfall_mm: Optional[str] = Query(
+        None,
+        description="Optional client-assisted live rainfall bins (NOW,+1h,+2h,+3h)",
+    ),
 ) -> Dict[str, Any]:
     """Flood-aware route (recommended + alternative + comparison + evidence).
 
@@ -1618,6 +1685,14 @@ def get_safe_route(
     never a guarantee.
     """
     try:
+        validated_transport_mode = validate_transport_mode(transport_mode)
+        if validated_transport_mode is not None and not model_state_id:
+            raise HTTPException(
+                status_code=409,
+                detail="transport routing requires model_state_id for the active map frame",
+            )
+        transport_hazards: Optional[Dict[str, dict]] = None
+        transport_state: Optional[Dict[str, Any]] = None
         if mode == "live":
             mode_states = get_live_reach_states(departure_hour)
             forecast = fetch_delhi_rainfall_forecast(use_cache=True)
@@ -1635,6 +1710,36 @@ def get_safe_route(
                 else "Open-Meteo NWP hourly forecast (UNAVAILABLE — routing "
                 "under all-UNKNOWN risk)"
             )
+            if validated_transport_mode is not None:
+                from backend.app.domain.delhi.live_state import get_cached_live_edge_hazards
+
+                client_mm: Optional[List[float]] = None
+                if client_rainfall_mm:
+                    try:
+                        values = [float(value.strip()) for value in client_rainfall_mm.split(",")]
+                        if len(values) >= 4 and all(value >= 0.0 for value in values[:4]):
+                            client_mm = values[:4]
+                    except ValueError:
+                        client_mm = None
+                transport_hazards, transport_state = get_cached_live_edge_hazards(
+                    departure_hour,
+                    client_rainfall_mm=client_mm,
+                )
+                transport_state["mode"] = "LIVE"
+                transport_state["city"] = "delhi"
+                if client_mm is not None:
+                    # The client-assisted bins are an exact active surface
+                    # frame, but the reach-state adapter only consumes the
+                    # server-side forecast fetch.  Do not combine those two
+                    # forecast identities in one route result.
+                    mode_states = None
+                    model_timestamp = transport_state.get("model_timestamp")
+                    forcing_source = transport_state.get("rainfall_source")
+                if transport_state.get("routing_state_id") != model_state_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="live model state changed; refresh the active forecast frame and retry",
+                    )
         else:
             if event_id is None:
                 raise HTTPException(status_code=400, detail="historical mode requires event_id")
@@ -1650,21 +1755,79 @@ def get_safe_route(
                         "for this event (absent forcing is never simulated)"
                     ),
                 )
-            if not 0 <= timestep_index < n_steps:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"timestep_index must be in [0, {n_steps - 1}] for {event_id}",
-                )
-            mode_states = get_historical_reach_states(event_id, timestep_index)
+            if not complete_24h or validated_transport_mode is None:
+                if not 0 <= timestep_index < n_steps:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"timestep_index must be in [0, {n_steps - 1}] for {event_id}",
+                    )
+            # The V1 depth frame is the authoritative active state for a
+            # completed 24-hour replay.  Those NWP-completed hours do not
+            # have a corresponding Phase 15.5 reach-chain execution, so the
+            # transport branch must not borrow a neighboring hydraulic state.
+            mode_states = (
+                None
+                if complete_24h and validated_transport_mode is not None
+                else get_historical_reach_states(event_id, timestep_index)
+            )
             declaration = get_declaration(event_id)
             mode_freshness_note = (
                 "historical evidence timestamps: forcing anchor "
-                f"{_iso(mode_states.data_timestamp_utc)}; this is EVENT "
+                f"{_iso(mode_states.data_timestamp_utc) if mode_states else 'active replay frame'}; this is EVENT "
                 "data (not live data) — model execution time is separate "
                 "and recorded in provenance"
             )
-            model_timestamp = mode_states.model_timestamp
+            model_timestamp = (
+                mode_states.model_timestamp if mode_states else None
+            )
             forcing_source = declaration.forcing_source
+            if validated_transport_mode is not None:
+                depth_payload = get_event_depth_grid(
+                    event_id=event_id,
+                    timestep_index=timestep_index,
+                    complete_24h=complete_24h,
+                    include_routing=True,
+                )
+                depth_step = depth_payload.get("step") or {}
+                if complete_24h:
+                    model_timestamp = depth_step.get("time_start")
+                    forcing_source = (
+                        depth_step.get("forcing")
+                        or depth_step.get("rainfall_source")
+                        or declaration.forcing_source
+                    )
+                routed_depths = depth_step.get("_routing_road_depths")
+                if not isinstance(routed_depths, dict):
+                    # Older cached artifacts can lack the internal complete
+                    # map.  Preserve the evidence boundary rather than
+                    # reconstructing dry values from the capped display list.
+                    routed_depths = {}
+                graph = get_road_graph()
+                transport_hazards = {
+                    edge_key: normalize_hazard(routed_depths.get(edge_key))
+                    for edge_key, edge in graph.edge_index.items()
+                }
+                transport_state = {
+                    "routing_state_id": (
+                        f"HISTORICAL:{event_id}:{timestep_index}:"
+                        f"{'24H' if complete_24h else 'DOCUMENTED'}"
+                    ),
+                    "event_id": event_id,
+                    "timestep_index": timestep_index,
+                    "mode": "HISTORICAL",
+                    "complete_24h": complete_24h,
+                    "model_timestamp": model_timestamp,
+                    "forecast_acquired_at": None,
+                    "rainfall_status": "HISTORICAL_REPLAY",
+                    "forcing_source": forcing_source,
+                    "model_version": "Delhi/Kushak Phase 8B replay routing",
+                    "city": "delhi",
+                }
+                if transport_state["routing_state_id"] != model_state_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="historical model state changed; retry against the selected replay frame",
+                    )
 
         result = compute_safe_route(
             origin_lon=origin_lon,
@@ -1675,12 +1838,15 @@ def get_safe_route(
             model_timestamp=model_timestamp,
             forcing_source=forcing_source,
             mode_freshness_note=mode_freshness_note,
+            transport_mode=validated_transport_mode,
+            edge_hazards=transport_hazards,
+            state_provenance=transport_state,
         )
         result["provenance"]["generated_at_utc"] = result["generated_at"]
         result["provenance"]["model_mode"] = production_mode()["production_mode"]
         result["data_freshness"] = {
             "note": mode_freshness_note,
-            "rainfall_updated_at": _iso(mode_states.data_timestamp_utc),
+            "rainfall_updated_at": _iso(mode_states.data_timestamp_utc) if mode_states else transport_state.get("forecast_acquired_at") if transport_state else None,
             "hydraulic_run_updated_at": model_timestamp,
             "road_network_updated_at": None,  # static committed extract; see provenance
             "observation_updated_at": None,
@@ -1874,7 +2040,12 @@ def get_scenario_safe_route(
     origin_lat: float = Query(..., description="Origin latitude (WGS84)"),
     dest_lon: float = Query(..., description="Destination longitude (WGS84)"),
     dest_lat: float = Query(..., description="Destination latitude (WGS84)"),
-    rainfall_mm_h: float = Query(..., ge=0, le=250, description="Scenario intensity [mm/h]"),
+    rainfall_mm_h: Optional[float] = Query(None, ge=0, le=250, description="WHAT-IF scenario intensity [mm/h]"),
+    scenario_id: Optional[str] = Query(None, description="Synthetic scenario id"),
+    run_id: Optional[str] = Query(None, description="Synthetic scenario run id"),
+    timestep_index: Optional[int] = Query(None, ge=0, description="Synthetic scenario timestep"),
+    transport_mode: Optional[str] = Query(None, description="Transport mode: car or walk"),
+    model_state_id: Optional[str] = Query(None, description="Exact active scenario frame identity"),
 ) -> Dict[str, Any]:
     """Flood-aware route under a WHAT-IF scenario intensity.
 
@@ -1885,6 +2056,93 @@ def get_scenario_safe_route(
     MODEL_SCENARIO / WHAT-IF throughout.
     """
     try:
+        validated_transport_mode = validate_transport_mode(transport_mode)
+        if rainfall_mm_h is None and not (scenario_id and run_id and timestep_index is not None):
+            raise HTTPException(
+                status_code=400,
+                detail="provide rainfall_mm_h for WHAT-IF or scenario_id, run_id, and timestep_index for a synthetic scenario",
+            )
+        if rainfall_mm_h is None and validated_transport_mode is None:
+            raise HTTPException(
+                status_code=400,
+                detail="synthetic scenario routing requires transport_mode=car or transport_mode=walk",
+            )
+        if validated_transport_mode is not None and not model_state_id:
+            raise HTTPException(status_code=409, detail="transport routing requires model_state_id for the active scenario frame")
+        if rainfall_mm_h is not None:
+            from backend.app.domain.delhi.live_state import get_cached_what_if_edge_hazards
+
+            transport_hazards, transport_state = get_cached_what_if_edge_hazards(rainfall_mm_h)
+            if validated_transport_mode is not None and transport_state.get("routing_state_id") != model_state_id:
+                raise HTTPException(status_code=409, detail="scenario state changed; refresh the selected WHAT-IF frame")
+        else:
+            result = load_scenario_result(run_id)
+            if result is None or result.get("scenario_id") != scenario_id:
+                raise HTTPException(status_code=404, detail="scenario run not found or scenario/run mismatch")
+            if not 0 <= timestep_index < result.get("n_steps", 0):
+                raise HTTPException(status_code=400, detail="scenario timestep is outside the selected run")
+            member = result.get("members", [{}])[0]
+            step = member.get("steps", [])[timestep_index]
+            # The member-level depth map is a last-step summary.  A route
+            # requested for an earlier frame must use that frame's own map.
+            road_depths = step.get("routing_road_depths", {})
+            from backend.app.domain.delhi.routing.transport import normalize_hazard
+
+            transport_hazards = {
+                edge_key: normalize_hazard(
+                    {
+                        "depth_m": record.get("depth_m"),
+                        "velocity_m_s": None,
+                        "uncertain": record.get("depth_m") is None,
+                        "source_type": record.get("source_type", "SIMULATED_MODEL_OUTPUT"),
+                        "reason": "scenario road-depth proxy; road-water velocity unavailable",
+                    }
+                )
+                for edge_key, record in road_depths.items()
+            }
+            transport_state = {
+                "routing_state_id": step.get("routing_state_id") or f"{scenario_id}:{run_id}:t{timestep_index}",
+                "scenario_id": scenario_id,
+                "run_id": run_id,
+                "timestep_index": timestep_index,
+                "mode": "SCENARIO",
+                "model_timestamp": step.get("time_start"),
+                "time_end": step.get("time_end"),
+                "model_version": result.get("generated_by"),
+                "city": "delhi",
+                "rainfall_status": "MODEL_SCENARIO",
+                "forcing_source": result.get("source_type"),
+            }
+            if transport_state["routing_state_id"] != model_state_id:
+                raise HTTPException(status_code=409, detail="scenario frame changed; retry against the current timestep")
+
+        if validated_transport_mode is not None:
+            result = compute_safe_route(
+                origin_lon=origin_lon,
+                origin_lat=origin_lat,
+                dest_lon=dest_lon,
+                dest_lat=dest_lat,
+                mode_states=None,
+                model_timestamp=transport_state.get("model_timestamp"),
+                forcing_source=transport_state.get("forcing_source"),
+                mode_freshness_note="MODEL_SCENARIO frame; deterministic synthetic/what-if state",
+                transport_mode=validated_transport_mode,
+                edge_hazards=transport_hazards,
+                state_provenance=transport_state,
+            )
+            result["mode"] = "SCENARIO"
+            result["scenario"] = {
+                "kind": "MODEL_SCENARIO",
+                "label": "WHAT-IF" if rainfall_mm_h is not None else "SYNTHETIC_SCENARIO",
+                "rainfall_mm_h": rainfall_mm_h,
+                "scenario_id": scenario_id,
+                "run_id": run_id,
+                "timestep_index": timestep_index,
+            }
+            result["max_depth_on_route_m"] = result["recommended_route"].get("max_depth_m") if result.get("recommended_route") else None
+            return result
+
+        assert rainfall_mm_h is not None
         edge_depths = get_cached_what_if_edge_depths(rainfall_mm_h)
         risk_by_edge = road_risk_override_from_depths(edge_depths)
 

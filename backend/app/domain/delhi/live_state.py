@@ -31,6 +31,7 @@ DATA PROVENANCE RULES (unchanged from the V2 evidence contracts):
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import threading
 from dataclasses import dataclass
@@ -64,6 +65,36 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 HORIZON_LABELS: Tuple[str, ...] = ("NOW", "+1h", "+2h", "+3h")
 LEAD_TIMES: Dict[str, str] = {"NOW": "0h", "+1h": "+1h", "+2h": "+2h", "+3h": "+3h"}
+MODEL_VERSION = "Delhi/Kushak Phase 8B V1-reference surface routing"
+
+
+def routing_state_id(
+    *,
+    status: str,
+    bins: Sequence[ForecastBin],
+    frame_key: str,
+    scenario_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> str:
+    """Stable identity for the exact hazard frame used by a route."""
+
+    payload = {
+        "model_version": MODEL_VERSION,
+        "status": status,
+        "frame_key": frame_key,
+        "scenario_id": scenario_id,
+        "run_id": run_id,
+        "bins": [
+            {
+                "start": b.time_start.isoformat() if b.time_start else None,
+                "end": b.time_end.isoformat() if b.time_end else None,
+                "depth_mm": b.depth_mm,
+                "provenance": b.provenance,
+            }
+            for b in bins
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:20]
 
 # V1 road-risk classification (backend/app/domain/roads/models.py semantics,
 # identical thresholds so both cities classify identically).
@@ -622,6 +653,10 @@ def _state_payload(
         return {
             "horizon": horizon,
             "lead_time": LEAD_TIMES[horizon],
+            "routing_state_id": routing_state_id(
+                status=fetch.status, bins=fetch.bins, frame_key=horizon
+            ),
+            "model_version": MODEL_VERSION,
             "rainfall_mm": None,
             "rainfall_provenance": "UNKNOWN",
             "status": "UNKNOWN_FORCING",
@@ -665,6 +700,10 @@ def _state_payload(
     payload = {
         "horizon": horizon,
         "lead_time": LEAD_TIMES[horizon],
+        "routing_state_id": routing_state_id(
+            status=fetch.status, bins=fetch.bins, frame_key=horizon
+        ),
+        "model_version": MODEL_VERSION,
         "rainfall_mm": round(rain_mm, 2),
         "rainfall_provenance": rain_prov,
         "time_start": t_start.isoformat() if t_start else None,
@@ -771,6 +810,13 @@ def build_what_if_state(rainfall_mm_h: float) -> dict:
     streets = _street_intelligence(step, structure, "SCENARIO")
     max_depth_m = round(step.max_depth_m, 3)
     return {
+        "routing_state_id": routing_state_id(
+            status="MODEL_SCENARIO",
+            bins=(),
+            frame_key=f"WHAT_IF:{round(rainfall_mm_h, 1):.1f}",
+            scenario_id=f"WHAT_IF:{round(rainfall_mm_h, 1):.1f}",
+        ),
+        "model_version": MODEL_VERSION,
         "scenario": {
             "kind": "MODEL_SCENARIO",
             "label": "WHAT-IF",
@@ -981,6 +1027,102 @@ def get_cached_live_states(
         return states
 
 
+def get_cached_live_edge_hazards(
+    departure_hour: int,
+    client_rainfall_mm: Optional[Sequence[float]] = None,
+) -> Tuple[Dict[str, dict], dict]:
+    """Return the exact live surface-depth frame used by the Delhi map.
+
+    The route endpoint uses the complete edge map rather than the capped
+    ``streets.affected_roads`` display list.  A missing forecast bin produces
+    UNKNOWN depth records for every edge; it never becomes zero depth.
+    """
+
+    if not 0 <= departure_hour <= 3:
+        raise ValueError("departure_hour must be within the 0-3h horizon")
+    if client_rainfall_mm is not None and len(client_rainfall_mm) >= 4:
+        fetch = client_forecast_fetch(client_rainfall_mm)
+        states = get_cached_live_states(
+            use_cache=True,
+            include_geo=False,
+            client_rainfall_mm=client_rainfall_mm,
+        )
+    else:
+        fetch = fetch_forecast_with_fallback(use_cache=True)
+        states = get_cached_live_states(use_cache=True, include_geo=False)
+    horizon = states["horizons"][departure_hour]
+    index, _ = _road_match_index()
+    graph = get_road_graph()
+
+    def expand_depths(depth_values: np.ndarray) -> Dict[str, Optional[float]]:
+        """Expand the deduplicated surface index to every directed graph edge.
+
+        The surface matcher intentionally deduplicates reverse geometries to
+        reduce memory.  Routing, however, retains directed one-way edges.  A
+        hazard record must therefore be present for both directions of a
+        bidirectional OSM way; otherwise the missing reverse record would be
+        misreported as UNKNOWN even though it uses the same modeled surface
+        sample.
+        """
+        depth_by_road: Dict[str, Optional[float]] = {}
+        for road_id, value in zip(index.road_ids, depth_values):
+            depth = float(value) if np.isfinite(value) else None
+            if road_id not in depth_by_road:
+                depth_by_road[road_id] = depth
+            elif depth is not None:
+                previous = depth_by_road[road_id]
+                depth_by_road[road_id] = depth if previous is None else max(previous, depth)
+        return {
+            edge_key: depth_by_road.get(edge.road_id)
+            for edge_key, edge in graph.edge_index.items()
+        }
+    rain_mm, rain_prov, time_start, time_end = _intensity_for_horizon(fetch, departure_hour)
+    hazards: Dict[str, dict] = {}
+    if rain_mm is None:
+        for edge_key in graph.edge_index:
+            hazards[edge_key] = {
+                "depth_m": None,
+                "velocity_m_s": None,
+                "uncertain": True,
+                "source_type": "UNKNOWN_FORCING",
+                "reason": "forecast bin is missing; no live surface state was computed",
+            }
+        return hazards, {
+            "routing_state_id": horizon.get("routing_state_id"),
+            "model_timestamp": time_start.isoformat() if time_start else None,
+            "time_end": time_end.isoformat() if time_end else None,
+            "forecast_acquired_at": fetch.acquired_at.isoformat() if fetch.acquired_at else None,
+            "rainfall_status": fetch.status,
+            "rainfall_source": fetch.source,
+            "rainfall_provenance": rain_prov,
+            "lead_time": horizon.get("lead_time"),
+            "model_version": MODEL_VERSION,
+        }
+    step = v1_depth_step_for_intensity(
+        depth_mm=rain_mm, dt_h=1.0, timestep_index=departure_hour
+    )
+    depths_by_edge = expand_depths(index.max_depth(step.depth_m))
+    for edge_key, depth in depths_by_edge.items():
+        hazards[edge_key] = {
+            "depth_m": depth,
+            "velocity_m_s": None,
+            "uncertain": depth is None,
+            "source_type": "SIMULATED_MODEL_OUTPUT (V1 reference depth grid)",
+            "reason": "nearest surface cell at segment midpoint; road-water velocity unavailable",
+        }
+    return hazards, {
+        "routing_state_id": horizon.get("routing_state_id"),
+        "model_timestamp": time_start.isoformat() if time_start else None,
+        "time_end": time_end.isoformat() if time_end else None,
+        "forecast_acquired_at": fetch.acquired_at.isoformat() if fetch.acquired_at else None,
+        "rainfall_status": fetch.status,
+        "rainfall_source": fetch.source,
+        "rainfall_provenance": rain_prov,
+        "lead_time": horizon.get("lead_time"),
+        "model_version": MODEL_VERSION,
+    }
+
+
 def get_cached_what_if(rainfall_mm_h: float) -> dict:
     """Deterministic what-if cache keyed by rounded intensity."""
     key = str(round(rainfall_mm_h, 1))
@@ -995,3 +1137,49 @@ def get_cached_what_if_edge_depths(rainfall_mm_h: float) -> Dict[str, Optional[f
     if key not in _WHAT_IF_EDGE_DEPTHS_CACHE:
         _WHAT_IF_EDGE_DEPTHS_CACHE[key] = what_if_edge_depths(rainfall_mm_h)
     return _WHAT_IF_EDGE_DEPTHS_CACHE[key]
+
+
+def get_cached_what_if_edge_hazards(rainfall_mm_h: float) -> Tuple[Dict[str, dict], dict]:
+    depths = get_cached_what_if_edge_depths(rainfall_mm_h)
+    state = get_cached_what_if(rainfall_mm_h)
+    graph = get_road_graph()
+
+    # ``what_if_edge_depths`` intentionally preserves the compact,
+    # deduplicated RoadSegmentIndex contract.  Transport routing needs the
+    # directed graph contract, so copy a way's modeled depth to both directed
+    # edges without changing the existing V1-parity helper.
+    depth_by_road: Dict[str, Optional[float]] = {}
+    for edge_key, depth in depths.items():
+        edge = graph.edge_index.get(edge_key)
+        if edge is None:
+            continue
+        previous = depth_by_road.get(edge.road_id)
+        depth_by_road[edge.road_id] = (
+            depth
+            if previous is None
+            else depth if depth is not None and depth > previous else previous
+        )
+    hazards = {
+        edge_key: {
+            "depth_m": depth_by_road.get(edge.road_id),
+            "velocity_m_s": None,
+            "uncertain": depth_by_road.get(edge.road_id) is None,
+            "source_type": "SIMULATED_MODEL_OUTPUT (MODEL_SCENARIO V1 reference depth grid)",
+            "reason": "scenario road-depth proxy; road-water velocity unavailable",
+        }
+        for edge_key, edge in graph.edge_index.items()
+    }
+    return hazards, {
+        "routing_state_id": state.get("routing_state_id"),
+        "mode": "SCENARIO",
+        "city": "delhi",
+        "scenario_id": f"WHAT_IF:{round(rainfall_mm_h, 1):.1f}",
+        "run_id": None,
+        "model_timestamp": None,
+        "time_end": None,
+        "forecast_acquired_at": None,
+        "rainfall_status": "MODEL_SCENARIO",
+        "rainfall_source": "uniform hypothetical rainfall input",
+        "rainfall_provenance": "MODEL_SCENARIO",
+        "model_version": MODEL_VERSION,
+    }

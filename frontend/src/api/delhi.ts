@@ -476,7 +476,7 @@ export const delhiApi = {
     getJson<{
       event_id: string;
       mode: string;
-      step: { max_depth_cm: number | null; flooded_cells: number; flood_state: string; depth_cells: { lon: number; lat: number; depth_cm: number; flood_state: string; provenance: string }[]; depth_polygons?: { type: string; features: unknown[] }; streets?: StreetsIntel | null; source_type: string; status: string; rainfall_provenance?: string; rainfall_source?: string };
+      step: { routing_state_id?: string | null; timestep_index?: number; time_start?: string | null; time_end?: string | null; max_depth_cm: number | null; flooded_cells: number; flood_state: string; depth_cells: { lon: number; lat: number; depth_cm: number; flood_state: string; provenance: string }[]; depth_polygons?: { type: string; features: unknown[] }; streets?: StreetsIntel | null; source_type: string; status: string; rainfall_provenance?: string; rainfall_source?: string };
       claim_policy: string;
       forcing_completion?: {
         status: string;
@@ -511,6 +511,10 @@ export const delhiApi = {
       timestep_index: String(params.timestep_index ?? 0),
     });
     if (params.event_id) q.set('event_id', params.event_id);
+    if (params.transport_mode) q.set('transport_mode', params.transport_mode);
+    if (params.model_state_id) q.set('model_state_id', params.model_state_id);
+    if (params.client_rainfall_mm?.length === 4) q.set('client_rainfall_mm', params.client_rainfall_mm.join(','));
+    if (params.complete_24h !== undefined) q.set('complete_24h', String(params.complete_24h));
     return getJson<SafeRouteResponse>(`/api/delhi/safe-route?${q.toString()}`, signal);
   },
   getModelScience: (signal?: AbortSignal) =>
@@ -538,7 +542,7 @@ export const delhiApi = {
       signal,
     ),
   getScenarioSafeRoute: (
-    params: { origin: [number, number]; destination: [number, number]; rainfall_mm_h: number },
+    params: ScenarioSafeRouteParams,
     signal?: AbortSignal,
   ) => {
     const q = new URLSearchParams({
@@ -546,8 +550,13 @@ export const delhiApi = {
       origin_lat: String(params.origin[1]),
       dest_lon: String(params.destination[0]),
       dest_lat: String(params.destination[1]),
-      rainfall_mm_h: String(params.rainfall_mm_h),
     });
+    if (params.rainfall_mm_h !== undefined) q.set('rainfall_mm_h', String(params.rainfall_mm_h));
+    if (params.scenario_id) q.set('scenario_id', params.scenario_id);
+    if (params.run_id) q.set('run_id', params.run_id);
+    if (params.timestep_index !== undefined) q.set('timestep_index', String(params.timestep_index));
+    if (params.transport_mode) q.set('transport_mode', params.transport_mode);
+    if (params.model_state_id) q.set('model_state_id', params.model_state_id);
     return getJson<ScenarioSafeRouteResponse>(`/api/delhi/scenario/safe-route?${q.toString()}`, signal);
   },
   getDrainageGraph: (signal?: AbortSignal) =>
@@ -591,20 +600,22 @@ export const delhiApi = {
       '/api/scenarios/config',
       signal,
     ),
-  scenarioRun: async (scenarioId: string) => {
-    const res = await fetch(apiUrl(`/api/scenarios/${scenarioId}/run`), { method: 'POST' });
+  scenarioRun: async (scenarioId: string, signal?: AbortSignal) => {
+    const res = await fetch(apiUrl(`/api/scenarios/${encodeURIComponent(scenarioId)}/run`), { method: 'POST', signal });
     if (!res.ok) {
       throw new Error(`scenario run failed (${res.status})`);
     }
     return (await res.json()) as { run_id: string; scenario_id: string; status: string };
   },
-  scenarioStatus: (scenarioId: string, runId: string) =>
+  scenarioStatus: (scenarioId: string, runId: string, signal?: AbortSignal) =>
     getJson<{ run_id: string; scenario_id: string; status: string }>(
-      `/api/scenarios/${scenarioId}/status?run_id=${runId}`,
+      `/api/scenarios/${encodeURIComponent(scenarioId)}/status?run_id=${encodeURIComponent(runId)}`,
+      signal,
     ),
-  scenarioResults: (scenarioId: string, runId: string, timestepIndex?: number) =>
+  scenarioResults: (scenarioId: string, runId: string, timestepIndex?: number, signal?: AbortSignal) =>
     getJson<ScenarioRunResult>(
-      `/api/scenarios/${scenarioId}/results?run_id=${runId}${timestepIndex !== undefined ? `&timestep_index=${timestepIndex}` : ''}`,
+      `/api/scenarios/${encodeURIComponent(scenarioId)}/results?run_id=${encodeURIComponent(runId)}${timestepIndex !== undefined ? `&timestep_index=${timestepIndex}` : ''}`,
+      signal,
     ),
   scenarioValidation: (scenarioId: string, runId: string) =>
     getJson<{ category: string; aggregated: Record<string, unknown>; claim_policy: string }>(
@@ -637,20 +648,61 @@ export interface RouteRiskSummary {
   elevated_risk_segments: number;
   unknown_segments: number;
   low_risk_segments: number;
+  uncertain_segments?: number;
+  hazardous_segments?: number;
+}
+
+export type TransportMode = 'car' | 'walk';
+export type SafetyClassification = 'LOWER_RISK' | 'CAUTION' | 'UNKNOWN' | 'NO_SAFE_ROUTE';
+
+export interface RoutingModelState {
+  state_id: string;
+  city: 'delhi';
+  mode: string;
+  model_timestamp: string | null;
+  time_end?: string | null;
+  forecast_acquired_at?: string | null;
+  rainfall_status?: string | null;
+  forcing_source?: string | null;
+  event_id?: string | null;
+  timestep_index?: number | null;
+  complete_24h?: boolean;
+  scenario_id?: string | null;
+  run_id?: string | null;
+  model_version?: string | null;
+  [key: string]: unknown;
+}
+
+export type RouteGeometry =
+  | { type: 'LineString'; coordinates: [number, number][] }
+  | { type: 'Feature'; properties: Record<string, unknown> | null; geometry: { type: 'LineString'; coordinates: [number, number][] } };
+
+// The API returns a Feature; older saved responses used a bare LineString.
+export function routeCoordinates(geometry: RouteGeometry | null | undefined): [number, number][] {
+  if (!geometry) return [];
+  return geometry.type === 'Feature' ? geometry.geometry.coordinates : geometry.coordinates;
 }
 
 export interface RoutePayload {
   edges: string[];
-  geometry: { type: string; coordinates: [number, number][] };
+  geometry: RouteGeometry;
   risk_segments: {
     type: 'FeatureCollection';
     features: {
-      properties: { segment_id: string; risk_state: string; name: string };
+      properties: {
+        segment_id: string; risk_state: string; name: string;
+        reasons?: string[]; risk_reason?: string; safety_classification?: SafetyClassification;
+        max_depth_m?: number | null; depth_m?: number | null; max_velocity_m_s?: number | null;
+        [key: string]: unknown;
+      };
       geometry: { type: string; coordinates: [number, number][] };
     }[];
   };
   total_distance_km: number;
-  estimated_travel_time_min: number;
+  estimated_travel_time_min: number | null;
+  safety_classification?: SafetyClassification;
+  max_depth_m?: number | null;
+  max_velocity_m_s?: number | null;
   flood_risk_summary: RouteRiskSummary;
   route_state: string;
   risk_penalty_s: number;
@@ -665,18 +717,21 @@ export interface SafeRouteResponse {
   generated_at: string;
   origin: { coords: [number, number]; snapped_road: string; snap_distance_m: number };
   destination: { coords: [number, number]; snapped_road: string; snap_distance_m: number };
-  recommended_route: RoutePayload;
+  transport_mode?: TransportMode;
+  model_state?: RoutingModelState;
+  safety_classification?: SafetyClassification;
+  recommended_route: RoutePayload | null;
   alternative_route: RoutePayload | null;
   no_alternative_reason: string | null;
   route_comparison: {
     recommended: RouteRiskSummary & {
       distance_km: number;
-      travel_time_min: number;
+      travel_time_min: number | null;
       risk_penalty_s: number;
-    };
+    } | null;
     alternative: (RouteRiskSummary & {
       distance_km: number;
-      travel_time_min: number;
+      travel_time_min: number | null;
       risk_penalty_s: number;
     }) | null;
   };
@@ -734,7 +789,21 @@ export interface SafeRouteParams {
   departure_hour?: number;
   event_id?: string;
   timestep_index?: number;
+  complete_24h?: boolean;
+  transport_mode?: TransportMode;
+  model_state_id?: string;
+  client_rainfall_mm?: number[];
 }
+
+export type ScenarioSafeRouteParams = {
+  origin: [number, number];
+  destination: [number, number];
+  transport_mode?: TransportMode;
+  model_state_id?: string;
+} & (
+  | { rainfall_mm_h: number; scenario_id?: never; run_id?: never; timestep_index?: never }
+  | { rainfall_mm_h?: never; scenario_id: string; run_id: string; timestep_index: number }
+);
 
 // ---------------------------------------------------------------------------
 // V1-parity live state (NOW/+1h/+2h/+3h) + WHAT-IF scenario
@@ -794,6 +863,7 @@ export interface StreetsIntel {
 }
 
 export interface LiveHorizonState {
+  routing_state_id?: string | null;
   horizon: 'NOW' | '+1h' | '+2h' | '+3h';
   lead_time: string;
   rainfall_mm: number | null;
@@ -830,6 +900,7 @@ export interface LiveStateResponse {
 }
 
 export interface WhatIfResponse {
+  routing_state_id?: string | null;
   scenario: { kind: string; label: string; rainfall_mm_h: number; note: string };
   status: string;
   max_depth_m: number;
@@ -845,16 +916,20 @@ export interface WhatIfResponse {
 export interface ScenarioSafeRouteResponse {
   status: string;
   mode: 'SCENARIO';
-  scenario: { kind: string; label: string; rainfall_mm_h: number };
+  scenario: { kind: string; label: string; rainfall_mm_h?: number; scenario_id?: string; run_id?: string; timestep_index?: number };
   generated_at: string;
   origin: { coords: [number, number]; snapped_road: string; snap_distance_m: number };
   destination: { coords: [number, number]; snapped_road: string; snap_distance_m: number };
-  recommended_route: RoutePayload;
+  transport_mode?: TransportMode;
+  model_state?: RoutingModelState;
+  safety_classification?: SafetyClassification;
+  recommended_route: RoutePayload | null;
   alternative_route: RoutePayload | null;
   no_alternative_reason: string | null;
   evidence_state: { route_state: string; reason: string };
   explanation: string[];
-  max_depth_on_route_m: number;
+  max_depth_on_route_m: number | null;
+  data_freshness?: SafeRouteResponse['data_freshness'];
   claim_policy: string;
   provenance: Record<string, unknown>;
 }
@@ -1099,6 +1174,7 @@ export interface ScenarioMeta {
 }
 
 export interface ScenarioStep {
+  routing_state_id?: string | null;
   timestep_index: number;
   time_start: string;
   time_end: string;
@@ -1125,6 +1201,7 @@ export interface ScenarioMember {
   // depth_cm is null when a segment midpoint falls outside the 45 m match
   // distance — UNKNOWN is never reported as 0 cm.
   road_depths: Record<string, { depth_cm: number | null; depth_m: number | null; water_depth_state: string; source_type: string }>;
+  routing_road_depths?: Record<string, { depth_cm: number | null; depth_m: number | null; water_depth_state: string; source_type: string }>;
   drainage_loading: {
     edge_id: string;
     node_id: string;

@@ -1,9 +1,58 @@
-# Safe Routing (Flood-Aware Routing)
+# Safe Routing (Flood-Aware, Transport-Aware Routing)
 
-*One routing core, three integrations: LIVE nowcast, HISTORICAL replay,
-EVIDENCE exploration.*
+*Two city-specific routing implementations: Mumbai/Kurla V1 and
+Delhi/Kushak V2. Chennai V3 remains disabled.*
 
-## What "safe" means here (read first)
+Mumbai V1 and Delhi V2 share the user-facing idea of a transport-aware flood
+screen, but they do not share graph data, hydraulic state, or thresholds. The
+sections below document each implementation separately.
+
+## Mumbai/Kurla V1
+
+V1 keeps its existing OSM Mumbai graph, Copernicus DEM + Manning-D8 flood
+pipeline, and affected-road street matcher. `GET /routing/safe-route` accepts
+the existing `horizon`, `rainfall_scenario_mm`, and `event` + `step` state
+selectors, plus:
+
+| Param | Meaning |
+| --- | --- |
+| `transport_mode` | Optional `car` or `walk`; omitted requests retain the legacy V1 behavior |
+| `horizon` | `NOW`, `+1h`, `+2h`, or `+3h` live/scenario horizon |
+| `rainfall_scenario_mm` | Scenario rainfall override used with the V1 street model |
+| `event`, `step` | Exact Mumbai 2017 replay hazard frame |
+
+V1 transport policy is deliberately a screening layer over the existing
+modelled street depths:
+
+- Car: provisional hazard margin at 0.10 m and exclusion at 0.30 m.
+- Walk: provisional hazard margin at 0.05 m and exclusion at 0.15 m.
+- Walking uses the V1 road centerline as a pedestrian proxy; the extract has
+  no surveyed sidewalks, crossings, closures, or water-velocity field.
+- OSM highway/access tags screen obvious mode-ineligible edges. One-way
+  vehicle restrictions do not automatically make walking one-way.
+- Policy thresholds and penalty weights are configurable prototype values,
+  not calibrated safety standards.
+- A missing street assessment is returned as `UNKNOWN`; it is never treated as
+  zero-depth pavement. A computed empty affected-road list remains the V1
+  model's dry result.
+- A non-empty affected-road response is a positive-match list, not a complete
+  edge-depth map. Unlisted transport edges therefore remain `UNKNOWN` and
+  receive the configured uncertainty penalty; they are not silently treated as
+  dry. This is why a historical route can be `UNKNOWN` even when its selected
+  geometry avoids the positively matched flooded roads.
+
+V1 responses include `transport_mode`, `safety_classification`, `model_state`
+with a deterministic `model_state_id`, policy metadata, route uncertainty
+counts, route edge identities for both the distance-only comparison and the
+selected route, and provenance. `SAFE`/`CAUTION` retain the existing V1 status
+values; `UNKNOWN`, `UNAVAILABLE`, and `NO_PATH_FOUND` remain explicit
+outcomes.
+
+The Mumbai frontend keeps the existing Safe Route map workflow and adds a
+compact Car/Walk selector. Switching mode, forecast horizon, scenario, or
+historical timestep reruns the route against that active V1 model state.
+
+## Delhi/Kushak V2 meaning of "safe" (read first)
 
 The recommended route is the route with the **lowest supported MODELED
 flood exposure under the currently available evidence**. It is **never**
@@ -21,7 +70,7 @@ a guarantee of safety:
   are listed explicitly, and force the route's evidence state down to
   LOW (weakest link).
 
-## Architecture
+## Delhi/Kushak V2 architecture
 
 ```
             ┌─────────────────────────────┐
@@ -33,12 +82,12 @@ a guarantee of safety:
             │  engine.py   cost + search  │
             │  state_source.py adapters   │
             └──────────────┬──────────────┘
-                           │ same engine, two state sources
+                            │ same engine, three state sources
           ┌────────────────┼────────────────┐
           ▼                ▼                ▼
-     LIVE NOWCAST    HISTORICAL       EVIDENCE
-     (nowcast        REPLAY (Phase    (route/segment
-      ensemble)       15.5 harness)    provenance API)
+      LIVE NOWCAST    MODEL SCENARIO   HISTORICAL REPLAY
+      (forecast +     (V1 reference    (Phase 15.5 +
+       V1 surface)    depth product)   selected frame)
 ```
 
 - `network.py` — graph over the committed OSM-derived pilot GeoJSON
@@ -72,8 +121,23 @@ a guarantee of safety:
   Travel speeds by OSM highway class are ASSUMED engineering defaults.
   Dijkstra with deterministic tie-breaking; the alternative route is a
   re-run with recommended roads re-costed (×4 divergence factor) and is
-  returned only if it is genuinely distinct (edge-set difference ≥ 30%),
-  otherwise `no_alternative_reason` explains why not.
+   returned only if it is genuinely distinct (edge-set difference ≥ 30%),
+   otherwise `no_alternative_reason` explains why not.
+- `transport.py` — validated `transport_mode: "car" | "walk"` rules. Car
+  excludes foot-only highway classes and uses a provisional 0.30 m depth
+  exclusion screen. Walk excludes motorways, requires explicit pedestrian
+  access for trunk roads, and uses a provisional 0.15 m depth exclusion
+  screen. Both values are configurable in `TRANSPORT_RISK_CONFIG`; they are
+  screening parameters informed by NOAA/NWS *Turn Around, Don't Drown*
+  guidance; the lower hazard bands are conservative early-warning margins,
+  not Delhi calibration or a safety guarantee. Walking applies a
+  stronger provisional penalty to elevated/uncertain segments because the
+  committed network has no surveyed sidewalk, crossing, or accessibility
+  layer.
+- Positive modeled depth without a velocity field remains uncertain: missing
+  velocity is never converted to zero. A confirmed closure or a mode
+  threshold breach hard-excludes the edge. Missing surface coverage remains
+  UNKNOWN and is never presented as lower risk.
 - `state_source.py` — mode adapters producing the SAME per-member
   per-reach structure: LIVE from the cached deterministic nowcast
   ensemble at the departure hour; HISTORICAL from the genuine Phase 15.5
@@ -90,11 +154,19 @@ a guarantee of safety:
 | `mode` | `live` (default) or `historical` |
 | `departure_hour` | LIVE: forecast hour 0–3 |
 | `event_id`, `timestep_index` | HISTORICAL: catalogue event + replay timestep |
+| `transport_mode` | Optional backward-compatible mode selector: `car` or `walk`; required by the transport-aware UI |
+| `model_state_id` | Exact active live/scenario/replay frame identity; stale transport requests return 409 |
+| `complete_24h` | HISTORICAL transport flag for the selected completed replay frame |
+| `client_rainfall_mm` | Optional client-assisted live four-bin forcing used for that exact active frame |
 
-Response: `recommended_route` (geometry, distance, ASSUMED-speed travel
-time, flood-risk summary, `route_state` = `LOWER_MODELED_RISK` or
-`CONDITIONAL_UNKNOWN_RISK_PORTION`), `alternative_route` (or
-`no_alternative_reason`), `route_comparison`, `evidence_state` (with the
+Transport-aware responses identify `transport_mode`, `model_state`, and
+`safety_classification` (`LOWER_RISK`, `CAUTION`, `UNKNOWN`, or
+`NO_SAFE_ROUTE`). `recommended_route` includes distance, supported ETA (or
+null), maximum modeled depth/velocity when available, and counts for
+elevated, hazardous, uncertain, unknown, and blocked segments.
+`alternative_route` is mode-specific and may be absent when no genuinely
+distinct path exists. The response also includes `route_comparison`,
+`evidence_state` (with the
 derivation text), `explanation` (structured facts), `data_freshness`
 (per-source timestamps), `provenance` (mode, event, model timestamp,
 forcing source, road-network source + acquisition date, mapping method +
@@ -130,17 +202,46 @@ source**.
 - Non-executable events (control, missing forcing) return HTTP 409 with
   `NOT_COMPUTABLE` — the system does not fabricate a historical route.
 
+## Transport safety criteria and limitations
+
+The route engine distinguishes evidence classes:
+
+1. `SIMULATED_MODEL_OUTPUT` depth is a model estimate on the derived 30 m
+   DSM and is not an observed road measurement.
+2. Verified closures, if supplied by a future closure feed, are hard
+   exclusions; no such feed is currently present in the committed extract.
+3. The depth limits and cost weights in `routing/transport.py` are explicitly
+   provisional screening parameters. They must be replaced or recalibrated
+   after a Delhi vehicle/pedestrian hazard study and local observations are
+   acquired.
+4. Missing depth, missing velocity, incomplete access tags, or rapidly
+   changing inputs remain UNKNOWN/uncertain. The frontend exposes this in the
+   selected route metrics and explanation rather than converting it to a
+   safety score.
+
+The walking network is an OSM road-centerline proxy where no sidewalk or
+crossing tags exist. It is not a pedestrian accessibility survey. No route
+classification guarantees that a person or vehicle can safely pass.
+
 ## Frontend
 
-The ROUTE tab (Delhi V2) follows the flow: pick origin/destination on
-the map → choose LIVE departure hour or HISTORICAL event + timestep
-slider → Find route. The map draws the recommended route (thick, white
-cased), the alternative (dashed), ELEVATED segments (amber), UNKNOWN
-segments (dotted grey) — color plus line-style plus legend, never color
-alone — with origin/destination pins. The panel shows the risk summary
-chips, comparison table, the structured WHY panel, the evidence state
-with its derivation, freshness timestamps, the run id, and a
-click-through segment evidence inspector for any risk segment.
+The Mumbai V1 Safe Route workflow follows: choose LIVE FORECAST, MODEL
+SCENARIO, or HISTORICAL REPLAY → click SAFE ROUTE → choose **Car** or
+**Walk** → pick origin and destination on the map. The existing V1 route
+geometry and shortest-path comparison remain visible; the HUD identifies the
+active V1 model-state fingerprint, selected mode, provisional threshold, and
+any UNKNOWN result. It does not draw a route when no route is available.
+
+The Delhi V2 Safe Route workflow follows: choose LIVE FORECAST, MODEL
+SCENARIO, or HISTORICAL REPLAY → click SAFE ROUTE → choose **Car** or
+**Walk** → pick origin and destination on the map. The map draws the
+mode-specific recommended route (thick, white-cased), any alternative
+(dashed), ELEVATED segments (amber), and UNKNOWN segments (dotted grey) —
+color plus line-style plus legend, never color alone — with origin and
+destination pins. The compact HUD shows the selected transport mode,
+classification, depth/velocity availability, uncertainty counts, active
+forecast/scenario/replay frame, and the explanation. A no-safe-route result
+is shown explicitly rather than drawing an unsafe route.
 
 ## Limitations
 
